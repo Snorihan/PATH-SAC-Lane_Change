@@ -1,0 +1,96 @@
+## So why utilize SB3 for SAC?
+
+| Implementing<br>SAC from scratch | Using Sb3             |
+| -------------------------------- | --------------------- |
+| Must manually build:             | Handles everything:   |
+| - Actor                          | - Actor + critics     |
+| - 2 critics                      | - Targets             |
+| - Target Network                 | - Soft-update($\tau$) |
+| - Replay Buffer                  | - Replay buffer       |
+| - Entropy training               | - Entropy             |
+
+- SB3 is safe for beginners like us
+
+## SB3 has default hyperparameter values set and tested for us
+``` Python 
+def create_sac(env, lr, log_dir):
+
+    model = SAC(
+
+        "MlpPolicy",
+        env,
+        learning_rate=lr, # hyperparameter 
+        buffer_size=100000, # hyperparameter 
+        batch_size=256, # hyperparameter 
+        gamma=0.99, # hyperparameter 
+        tau=0.005, # hyperparameter 
+        train_freq=1, # hyperparameter 
+        gradient_steps=1, # hyperparameter 
+        ent_coef="auto", # hyperparameter 
+        verbose=1,
+        tensorboard_log=log_dir,
+    )
+
+    return model
+```
+
+>[!What does each HP do?]
+
+5.1. **Learning rate**. Controls how fast we will be updating the <span style="color:rgb(0, 176, 240)">actor and critic networks</span>
+- **If it is too high** -> actor and critic skip the correct solution -> unstable learning results
+- **If it is too low** -> learning becomes slow. We need more timesteps 
+	- Look into https://www.reinforcementlearningpath.com/the-complete-guide-of-learning-rate-in-rl/ to figure out how to choose learning rates 
+
+5.2. **Buffer size**: The reason why SAC is <span style="color:rgb(0, 176, 240)">sample efficient </span>
+- The larger the buffer, the more the agent can learn from more old experiences and the better it gets. An example is about 1M buffers
+
+5.3. **Batch Size**: How many transitions <span style="color:rgb(0, 176, 240)">utilized in a single update </span>
+- Small batch (32-64) -> unstable updates with noisy Q values
+- Large batch (256-512) -> More stable estimates, smoother learning curves
+
+5.4. **ent_coef** (entropy coefficient). Controls how much the agent explores
+- Recall, entropy is part of the objective. SAC rewards the model for staying curious
+
+In SAC, this is modeled as:
+$$
+\max_{\pi} \; \mathbb{E}_{\pi}\left[\sum_{t=0}^{T} r(s_t, a_t) + \alpha \, \mathcal{H}\big(\pi(\cdot \mid s_t)\big)\right]
+
+$$
+$r_t$ = the reward 
+$\mathcal{H}(\pi)$ = entropy of the policy 
+$\alpha$ = entropy coefficient (oh hi ent_coef) 
+
+What this does is that early in the training, we have high entropy -> will try lots of actions 
+Later on, entropy decreases -> commit to good behavior 
+
+	So why is the entropy coeff "auto"?
+
+This makes it so SB3 treats $\alpha$ as a learned parameter that tunes it well... automatically. This seems to be the industry norm for it. In other words let us not reinvent the wheel 
+
+
+**NOTE: It is not train critic -> train actor. They train in tandem**
+
+5.5 **Tau**: this controls the soft update of target critics 
+$$Target_{param} = \tau * online_{param} * (1-\tau) * target_{param}$$
+- high tau: (0.01-0.02) -> fast updates but agents will be unstable
+- low tau (0.005) -> default value -> slow and stable updates
+
+5.6 **Gamma**: The discount factor.
+- More details here: https://www.reinforcementlearningpath.com/discount-factor-explained-why-gamma-%ce%b3-makes-or-breaks-learning-q-learning-cartpole-case-study/
+- high gamma (0.99 - 0.999) -> Agent makes long-term, stable decisions 
+- low gamma (0.90 - 0.95) -> Agent only sees the immediate effects -> unstable, learns chaotically 
+
+	The standard is high gamma
+
+5.7 **train_freq** and **gradient_steps**: 
+- *Train_freq*: how often we update
+- *Gradient_steps*: how many updates at each state 
+
+Default:
+```Python 
+train_freq = 1 
+gradient_steps = 1 
+```
+at each step -> we extract a batch -> we do an update 
+n_updates = total timesteps 
+
