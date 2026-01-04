@@ -11,13 +11,14 @@ class ObsWrapper(gym.ObservationWrapper):
     def __init__(self, env: gym.Env):
         super().__init__(env)
 
+        NUM_ADDED_FEATURES = 2 # so for lane_distance_to_target and target_lane_norm
         base_shape = self.observation_space.shape  # e.g. (5, 5)
         base_dim = int(np.prod(base_shape))
 
         self.observation_space = spaces.Box(
             low=-np.inf,
             high=np.inf,
-            shape=(base_dim + 2,),
+            shape=(base_dim + NUM_ADDED_FEATURES,),
             dtype=np.float32
         )
 
@@ -25,6 +26,9 @@ class ObsWrapper(gym.ObservationWrapper):
         obs_flat = np.asarray(obs, dtype=np.float32).ravel()
         obs_flat = np.nan_to_num(obs_flat, nan=0.0, posinf=0.0, neginf=0.0)
 
+        if not np.isfinite(obs_flat).all():
+            raise ValueError("Non-finite obs detected")
+        
         base_env = self.env.unwrapped
         current_lane = int(base_env.vehicle.lane_index[2])
         target_lane = int(getattr(base_env, "target_lane", current_lane))
