@@ -20,6 +20,7 @@ register(
 
 class LaneChangingEnv(HighwayEnv):
 
+    @classmethod
     def default_config(cls) -> dict:
         config = super().default_config()
         config.update({
@@ -34,6 +35,7 @@ class LaneChangingEnv(HighwayEnv):
                 # more weights to come
             }
         })
+        config.update({"duration_after_lane_change": 40}) # Steps to see car behavior after lane change
         config.update({"lane_change_lat_threshold": 0.5})
         return config
     # Action = [acceleration, steering] for now
@@ -100,19 +102,30 @@ class LaneChangingEnv(HighwayEnv):
         curr_acc = self.vehicle.action["acceleration"]
         reward = 0.0
 
+        # Calculate components
+        r_collision = w["collision"] if self.vehicle.crashed else 0.0
+        r_jerk = (abs(self._reward_funct_jerk(curr_time, curr_acc)) - 0.5) * w["jerk_weight"]
+        r_speed = self._r_fn_relative_speeds() * w["speed_relative_to_nearby_vehicles_weight"]
+        r_dist = self._r_fn_relative_distance() * w["dist_relative_to_nearby_vehicles_weight"]
+        r_limit = self._r_fn_matching_speed_limit() * w["follow_spd_lmt_weight"]
+        r_success = self._r_fn_lane_change_success(self.vehicle.lane_index) * w["lane_success"]
+        r_changing = self._r_fn_lane_changing() * w["lane_changing_weight"]
+
         if self.vehicle.crashed:
-            reward -= w["collision"] # want no crashes. Maybe we make it infinity idk. Wait we terminate the episode on crash this is useless ehhh
+            reward += r_collision # Add negative reward
 
-        reward -= (abs(self._reward_funct_jerk(curr_time, curr_acc)) - 0.5) * w["jerk_weight"]
-        # according to studies, discomfort for jerk starts around 0.5 m/s^3
+        reward -= r_jerk
+        reward += r_speed
+        reward += r_dist
+        reward += r_limit
+        reward += r_success
+        reward += r_changing
 
-        reward += self._r_fn_relative_speeds() * w["speed_relative_to_nearby_vehicles_weight"]
-        reward += self._r_fn_relative_distance() * w["dist_relative_to_nearby_vehicles_weight"]
-        reward += self._r_fn_matching_speed_limit() * w["follow_spd_lmt_weight"]
-        reward += self._r_fn_lane_change_success(self.vehicle.lane_index) * w["lane_success"]
-        reward += self._r_fn_lane_changing() * w["lane_changing"]
-
-        
+        self.reward_dict = {
+            "r_collision": r_collision, "r_jerk": r_jerk, "r_speed": r_speed,
+            "r_dist": r_dist, "r_limit": r_limit, "r_success": r_success, "r_changing": r_changing,
+            "raw_jerk": self.last_jerk_value
+        }
         return reward
 
     def step(self, action):
@@ -127,6 +140,18 @@ class LaneChangingEnv(HighwayEnv):
 
         # geometry-based indicator
         self.lane_changing = (abs(lat) > lat_threshold)
+        if hasattr(self, "reward_dict"):
+            info.update(self.reward_dict)
+
+        # ---- Termination Logic: End N steps after reaching target ----. Possible bug about a new lane change 
+        if self.vehicle.lane_index == self.target_lane_index:
+            self.steps_in_target_lane += 1
+        else:
+            self.steps_in_target_lane = 0 # Reset if we drift back out
+
+        if self.steps_in_target_lane >= self.config.get("duration_after_lane_change", 40):
+            terminated = True
+
         return obs, reward, terminated, truncated, info
 
     def reset(self, *args, **kwargs):
@@ -134,6 +159,8 @@ class LaneChangingEnv(HighwayEnv):
         self.lane_changing = False
         self.prev_acceleration = 0.0 # this is for the reward function
         self.prev_lat = 0.0
+        self.steps_in_target_lane = 0
+        self.last_jerk_value = 0.0
         self.start_time = getattr(self, "time", 0.0) # find the start time
         self.start_lane_index = self.vehicle.lane_index # lane where the vehicle is. This is more a node. If we want spacial reasoning use .get_lane(__)
         self.target_lane_index = self.find_target_lane(self.start_lane_index)
@@ -145,9 +172,14 @@ class LaneChangingEnv(HighwayEnv):
     def _reward_funct_jerk(self, curr_time, curr_acc):
         time_dt = curr_time - self.start_time
 
+        if time_dt <= 1e-6:
+            self.last_jerk_value = 0.0
+            return 0.0
+
         acc_dt = curr_acc - self.prev_acceleration
         jerk = acc_dt / time_dt
 
+        self.last_jerk_value = jerk
         self.start_time = curr_time
         self.prev_acceleration = curr_acc
         return jerk
