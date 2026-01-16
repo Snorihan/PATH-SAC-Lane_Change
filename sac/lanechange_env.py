@@ -6,12 +6,32 @@ from highway_env import utils
 from highway_env.envs.common.abstract import AbstractEnv
 from highway_env.envs.highway_env import HighwayEnv
 from highway_env.vehicle.controller import ControlledVehicle
+from highway_env.road.road import Road, RoadNetwork
+from highway_env.road.lane import StraightLane, LineType
 from highway_env.vehicle.kinematics import Vehicle
 from enum import Enum
 import numpy as np
 import pprint
 import wrappers
+from highway_env.envs.common.action import ActionType  # highway-env import
 
+class IntentContinuousAction(ActionType):
+    vehicle_class = ControlledVehicle
+    """
+    Action = [accel_norm, intent]
+    accel_norm in [-1,1] -> m/s^2
+    intent in [-1,1] -> your lane selection logic in _apply_action()
+    """
+    def space(self):
+        return spaces.Box(
+            low=np.array([-1.0, -1.0], dtype=np.float32),
+            high=np.array([1.0, 1.0], dtype=np.float32),
+            dtype=np.float32
+        )
+
+    def act(self, action):
+        # This is the critical line: route actions to YOUR mapping
+        self.env._apply_action(action)
 # register model as gym env. Once registered, the id is usable for gym.make()
 register(
     id = 'lane-changing-v0',
@@ -28,78 +48,96 @@ class LaneChangingEnv(HighwayEnv):
                 "collision": -500.0,
                 "lane_success": 5.0,
                 "jerk_weight" : 5.0,
-                "dist_relative_to_nearby_vehicles_weight": 100.0,
+                "dist_relative_to_nearby_vehicles_weight": 10.0,
                 "speed_relative_to_nearby_vehicles_weight": 10,
                 "follow_spd_lmt_weight": 1,
                 "lane_changing_weight": 5.0, # kind of a gradient yknow
                 # more weights to come
             }
         })
-        config.update({"duration_after_lane_change": 40}) # Steps to see car behavior after lane change
+        config.update({"duration_after_lane_change": 100}) # Steps to see car behavior after lane change
         config.update({"duration_before_lane_change": 40}) # Steps to stay in lane before changing
         config.update({"lane_change_lat_threshold": 0.5})
         return config
     # Action = [acceleration, steering] for now
 
+    def define_spaces(self) -> None:
+        super().define_spaces()
+
+        # Force our custom action type regardless of config["action"]["type"]
+        self.action_type = IntentContinuousAction(self)
+        self.action_space = self.action_type.space()
+
+    def _create_road(self) -> None:
+        """
+        Create a long, straight, eastbound road (positive x direction)
+        with `lanes_count` parallel lanes.
+        """
+        net = RoadNetwork()
+
+        lanes = int(self.config.get("lanes_count", 4))
+        lane_width = float(self.config.get("lane_width", 4.0))
+        road_length = float(self.config.get("road_length", 1000.0))
+
+        from_n, to_n = "0", "1"
+
+        for lane_id in range(lanes):
+            origin = [0.0, lane_id * lane_width]
+            end = [road_length, lane_id * lane_width]
+
+            # Outer boundaries solid; interior boundaries striped
+            left_type = LineType.CONTINUOUS if lane_id == 0 else LineType.STRIPED
+            right_type = LineType.CONTINUOUS if lane_id == lanes - 1 else LineType.STRIPED
+            line_types = [left_type, right_type]
+
+            net.add_lane(from_n, to_n, StraightLane(origin, end, width=lane_width, line_types=line_types))
+
+        self.road = Road(network=net, np_random=self.np_random)
+
     def __init__(self, config = None, render_mode = None):
         super().__init__(config=config, render_mode=render_mode)
      
-    def _create_action_space(self):
-        # accel = action[0] 
-        # steer = action[1] 
-        # we will need to scale them accordingly later. Accel is m/s^2 and steer is in degrees (after change)
-        self.action_space = spaces.Box(
-            low = np.array([-1.0, -1.0]), 
-            high = np.array([1.0, 1.0]),
-            dtype = np.float32
-        )
+    # def _create_action_type(self):
+    #     self.action_type = IntentContinuousAction(self)
+    #     self.action_space = self.action_type.space()
 
     def _apply_action(self, action):
-        """
-        Map continuous action to vehicle control.
-        """
         accel_norm, intent = float(action[0]), float(action[1])
-
         vehicle: ControlledVehicle = self.vehicle
         if vehicle is None:
             return
 
-        # Longitudinal: normalized -> physical accel
-        max_accel = 3.0
-        acceleration = np.clip(accel_norm, -1.0, 1.0) * max_accel
-
-        # Lateral: decide which lane to track (current vs target)
+        # ---- lane target ----
         deadzone = 0.2
-        current_lane_index = vehicle.lane_index  # (from_node, to_node, lane_id)
-        from_n, to_n, lane_id = current_lane_index
+        from_n, to_n, lane_id = vehicle.lane_index
 
-        # determine number of lanes on the current segment (more correct than config)
         try:
             lanes_on_segment = len(vehicle.road.network.graph[from_n][to_n])
         except Exception:
             lanes_on_segment = int(self.config.get("lanes_count", 4))
 
-        # choose lane to follow
         if abs(intent) < deadzone:
-            desired_lane_id = int(lane_id)  # keep lane
+            desired_lane_id = int(lane_id)
         else:
-            target = getattr(self, "target_lane_index", lane_id)
-            if isinstance(target, tuple):
-                desired_lane_id = int(target[2])
-            else:
-                desired_lane_id = int(target)
+            # track the env target lane (what you want long-term)
+            target = getattr(self, "target_lane_index", vehicle.lane_index)
+            desired_lane_id = int(target[2]) if isinstance(target, tuple) else int(target)
 
         desired_lane_id = int(np.clip(desired_lane_id, 0, lanes_on_segment - 1))
         target_lane_index = (from_n, to_n, desired_lane_id)
 
-        # Use controller to compute steering angle to track the chosen lane
-        steering = float(vehicle.steering_control(target_lane_index))
+        # ---- speed target ----
+        max_accel = 3.0
+        a = np.clip(accel_norm, -1.0, 1.0) * max_accel
+        dt = 1.0 / float(self.config.get("policy_frequency", 15))
 
-        # Apply to vehicle
-        vehicle.action = {
-            "acceleration": acceleration,
-            "steering": steering
-        }
+        # integrate accel into a desired speed target
+        desired_speed = float(np.clip(vehicle.speed + a * dt, 0.0, 40.0))
+
+        # set targets (these survive the sim calling vehicle.act())
+        vehicle.target_lane_index = target_lane_index
+        vehicle.target_speed = desired_speed
+
 
     def _reward(self, action):
         w = self.config["rewards"]
@@ -136,11 +174,7 @@ class LaneChangingEnv(HighwayEnv):
     def step(self, action):
         obs, reward, terminated, truncated, info = super().step(action)
 
-        # ---- Update Target Logic (Warmup Phase) ----
         self.elapsed_steps += 1
-        if self.elapsed_steps == self.config.get("duration_before_lane_change", 40):
-            # Time to change lanes: update the target to the actual goal
-            self.target_lane_index = self.ultimate_target_lane_index
 
         # ---- Update lane-changing flag ----
         lane = self.road.network.get_lane(self.vehicle.lane_index)
@@ -182,6 +216,8 @@ class LaneChangingEnv(HighwayEnv):
         
         # self.target_lane = int(np.clip(self.target_lane, 0, self.config.get("lanes_count", 4) - 1))
         # print("ROAD: ", dir(self.road)) # self.road.neighbor_vehicles exists wow
+        print("EGO TYPE:", type(self.vehicle))
+
         return obs, info
     
     def _reward_funct_jerk(self, curr_time, curr_acc):
@@ -328,7 +364,7 @@ class LaneChangingEnv(HighwayEnv):
             if v == ego:
                 continue 
 
-            if getattr(v, "lane", None) is not lane:
+            if v.lane_index != lane_index:
                 continue
             
             veh_s, veh_lat = self.road.network.get_lane(v.lane_index).local_coordinates(v.position)
@@ -343,58 +379,35 @@ class LaneChangingEnv(HighwayEnv):
 
         return front_vehicle, rear_vehicle, gap_front, gap_rear
 
+    # def find_target_lane(self, start_lane_index):
+    #     """
+    #     Return an abstract lane (LaneIndex) rather than a lane_id number.
+    #     start_lane_index: (from_node, to_node, lane_id). Will be changed when I figure out the trigger network
+    #     """
+    #     from_n, to_n, lane_id = start_lane_index
+
+    #     # choose target lane id (example: +1 lane to the left/right depending on your convention)
+    #     target_lane_id = int(lane_id) + 1
+
+    #     # clamp to lanes available on this road segment
+    #     try:
+    #         lanes_on_segment = len(self.road.network.graph[from_n][to_n])
+    #     except Exception:
+    #         lanes_on_segment = int(self.config.get("lanes_count", 4))
+
+    #     target_lane_id = int(np.clip(target_lane_id, 0, lanes_on_segment - 1))
+
+    #     return (from_n, to_n, target_lane_id)
+
     def find_target_lane(self, start_lane_index):
-        """
-        Return an abstract lane (LaneIndex) rather than a lane_id number.
-        start_lane_index: (from_node, to_node, lane_id). Will be changed when I figure out the trigger network
-        """
+        '''Temporary to just choose the adjacent lanes. We will train another network to do so later'''
         from_n, to_n, lane_id = start_lane_index
+        lanes = int(self.config.get("lanes_count", 4))
+        # prefer +1, else -1
+        target = lane_id + 1 if lane_id + 1 < lanes else lane_id - 1
+        target = int(np.clip(target, 0, lanes - 1))
+        return (from_n, to_n, target)
 
-        # choose target lane id (example: +1 lane to the left/right depending on your convention)
-        target_lane_id = int(lane_id) + 1
-
-        # clamp to lanes available on this road segment
-        try:
-            lanes_on_segment = len(self.road.network.graph[from_n][to_n])
-        except Exception:
-            lanes_on_segment = int(self.config.get("lanes_count", 4))
-
-        target_lane_id = int(np.clip(target_lane_id, 0, lanes_on_segment - 1))
-
-        return (from_n, to_n, target_lane_id)
-
-    def _create_vehicles(self) -> None:
-        """
-        Overridden to create a custom hardcoded traffic scenario.
-        """
-        # 1. Clear the road
-        self.road.vehicles = []
-        
-        # 2. Create Ego Vehicle
-        # Start in lane 0, speed 25
-        # Note: We assume a standard straight road exists from HighwayEnv._make_road
-        ego_lane = self.road.network.get_lane(("0", "1", 0))
-        self.vehicle = self.action_type.vehicle_class(
-            self.road,
-            ego_lane.position(0, 0),
-            speed=25,
-            heading=ego_lane.heading_at(0)
-        )
-        self.road.vehicles.append(self.vehicle)
-        self.controlled_vehicles = [self.vehicle]
-
-        # 3. Create Neighbors (Hardcoded)
-        # Example: A vehicle in the target lane (lane 1) that is 20m ahead and slower
-        # This forces the agent to either slow down before merging or wait.
-        target_lane = self.road.network.get_lane(("0", "1", 1))
-        neighbor = Vehicle(
-            self.road,
-            target_lane.position(20, 0), # 20m ahead
-            speed=20, # Slower than ego (25)
-            heading=target_lane.heading_at(20)
-        )
-        self.road.vehicles.append(neighbor)
-    
 
 def check_env(): 
     from gymnasium.utils.env_checker import check_env
