@@ -25,17 +25,18 @@ class LaneChangingEnv(HighwayEnv):
         config = super().default_config()
         config.update({
             "rewards": { # treating these almost like binary strings MSB/LSB weighings
-                "collision": -10000.0,
-                "lane_success": 1,
-                "jerk_weight" : 10,
-                "dist_relative_to_nearby_vehicles_weight": 100,
+                "collision": -500.0,
+                "lane_success": 5.0,
+                "jerk_weight" : 5.0,
+                "dist_relative_to_nearby_vehicles_weight": 100.0,
                 "speed_relative_to_nearby_vehicles_weight": 10,
                 "follow_spd_lmt_weight": 1,
-                "lane_changing_weight": 100, # kind of a gradient yknow
+                "lane_changing_weight": 5.0, # kind of a gradient yknow
                 # more weights to come
             }
         })
         config.update({"duration_after_lane_change": 40}) # Steps to see car behavior after lane change
+        config.update({"duration_before_lane_change": 40}) # Steps to stay in lane before changing
         config.update({"lane_change_lat_threshold": 0.5})
         return config
     # Action = [acceleration, steering] for now
@@ -82,7 +83,11 @@ class LaneChangingEnv(HighwayEnv):
         if abs(intent) < deadzone:
             desired_lane_id = int(lane_id)  # keep lane
         else:
-            desired_lane_id = int(getattr(self, "target_lane_index", lane_id))  # commit to goal
+            target = getattr(self, "target_lane_index", lane_id)
+            if isinstance(target, tuple):
+                desired_lane_id = int(target[2])
+            else:
+                desired_lane_id = int(target)
 
         desired_lane_id = int(np.clip(desired_lane_id, 0, lanes_on_segment - 1))
         target_lane_index = (from_n, to_n, desired_lane_id)
@@ -131,6 +136,12 @@ class LaneChangingEnv(HighwayEnv):
     def step(self, action):
         obs, reward, terminated, truncated, info = super().step(action)
 
+        # ---- Update Target Logic (Warmup Phase) ----
+        self.elapsed_steps += 1
+        if self.elapsed_steps == self.config.get("duration_before_lane_change", 40):
+            # Time to change lanes: update the target to the actual goal
+            self.target_lane_index = self.ultimate_target_lane_index
+
         # ---- Update lane-changing flag ----
         lane = self.road.network.get_lane(self.vehicle.lane_index)
         _, lat = lane.local_coordinates(self.vehicle.position)
@@ -160,11 +171,15 @@ class LaneChangingEnv(HighwayEnv):
         self.prev_acceleration = 0.0 # this is for the reward function
         self.prev_lat = 0.0
         self.steps_in_target_lane = 0
+        self.elapsed_steps = 0
         self.last_jerk_value = 0.0
         self.start_time = getattr(self, "time", 0.0) # find the start time
         self.start_lane_index = self.vehicle.lane_index # lane where the vehicle is. This is more a node. If we want spacial reasoning use .get_lane(__)
-        self.target_lane_index = self.find_target_lane(self.start_lane_index)
-        # limit to the lanes on the road
+        
+        # Determine the ultimate goal, but initially target the start lane (warmup)
+        self.ultimate_target_lane_index = self.find_target_lane(self.start_lane_index)
+        self.target_lane_index = self.ultimate_target_lane_index
+        
         # self.target_lane = int(np.clip(self.target_lane, 0, self.config.get("lanes_count", 4) - 1))
         # print("ROAD: ", dir(self.road)) # self.road.neighbor_vehicles exists wow
         return obs, info
@@ -348,6 +363,37 @@ class LaneChangingEnv(HighwayEnv):
 
         return (from_n, to_n, target_lane_id)
 
+    def _create_vehicles(self) -> None:
+        """
+        Overridden to create a custom hardcoded traffic scenario.
+        """
+        # 1. Clear the road
+        self.road.vehicles = []
+        
+        # 2. Create Ego Vehicle
+        # Start in lane 0, speed 25
+        # Note: We assume a standard straight road exists from HighwayEnv._make_road
+        ego_lane = self.road.network.get_lane(("0", "1", 0))
+        self.vehicle = self.action_type.vehicle_class(
+            self.road,
+            ego_lane.position(0, 0),
+            speed=25,
+            heading=ego_lane.heading_at(0)
+        )
+        self.road.vehicles.append(self.vehicle)
+        self.controlled_vehicles = [self.vehicle]
+
+        # 3. Create Neighbors (Hardcoded)
+        # Example: A vehicle in the target lane (lane 1) that is 20m ahead and slower
+        # This forces the agent to either slow down before merging or wait.
+        target_lane = self.road.network.get_lane(("0", "1", 1))
+        neighbor = Vehicle(
+            self.road,
+            target_lane.position(20, 0), # 20m ahead
+            speed=20, # Slower than ego (25)
+            heading=target_lane.heading_at(20)
+        )
+        self.road.vehicles.append(neighbor)
     
 
 def check_env(): 
@@ -356,9 +402,9 @@ def check_env():
     env = wrappers.ObsWrapper(env)
 
     check_env(env.unwrapped)
-    print((env.observation_space))
-    print("--Config list--")
-    pprint.pprint(env.unwrapped.config)
+    # print((env.observation_space))
+    # print("--Config list--")
+    # pprint.pprint(env.unwrapped.config)
 
 
 if __name__ == '__main__':

@@ -31,7 +31,12 @@ class ObsWrapper(gym.ObservationWrapper):
         
         base_env = self.env.unwrapped
         current_lane = int(base_env.vehicle.lane_index[2])
-        target_lane = int(getattr(base_env, "target_lane", current_lane))
+        
+        # Fix: Handle target_lane_index tuple from LaneChangingEnv
+        if hasattr(base_env, "target_lane_index"):
+            target_lane = int(base_env.target_lane_index[2])
+        else:
+            target_lane = int(getattr(base_env, "target_lane", current_lane))
 
         lanes_count = int(base_env.config.get("lanes_count", 4))
         denom = max(lanes_count - 1, 1)
