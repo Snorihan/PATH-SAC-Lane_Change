@@ -55,7 +55,7 @@ def main():
         "duration": 80,
     }
 
-    env = gym.make("lane-changing-v0", config=config, render_mode=None)
+    env = gym.make("lane-changing-v0", config=config, render_mode="human")
     base = env.unwrapped
 
     # --- Reset once ---
@@ -80,7 +80,7 @@ def main():
         base.lane_changing = False
 
     # --- Rollout parameters ---
-    n_steps = 300
+    n_steps = 100
     dt = 1.0 / float(base.config.get("policy_frequency", 15))
 
     # --- Aggregation ---
@@ -112,6 +112,7 @@ def main():
     for k in range(n_steps):
         action = sample_action(k)
         obs, reward, terminated, truncated, info = env.step(action)
+        env.render() # Ensure PyGame updates
 
         # --- Update lane_changing flag for testing purposes ---
         # (If you update it elsewhere in your env, remove this block.)
