@@ -20,6 +20,7 @@ import time
 import numpy as np
 import gymnasium as gym
 
+from highway_env.vehicle.controller import ControlledVehicle
 # Ensure your env module is imported so the register() call runs.
 # If you register in lanechange_env.py, import it here.
 import lanechange_env  # noqa: F401
@@ -43,7 +44,7 @@ def main():
     # --- Create env with configs that increase chance of neighbors existing ---
     # You may need to tweak these depending on your highway_env version.
     config = {
-        "action": {"type": "ContinuousAction"},
+        # "action": {"type": "ContinuousAction"},
         # Try to keep traffic present so front/rear vehicles exist
         "vehicles_count": 25,
         "controlled_vehicles": 1,
@@ -52,14 +53,28 @@ def main():
         "speed_limit": 30.0,  # whatever unit your env uses for speed; just be consistent
         # Keep sim stable
         "policy_frequency": 15,
-        "duration": 80,
+        "duration": 300,
     }
+
+    # --- Monkey-patch the controller gains to be less aggressive ---
+    # The default PD controller is too aggressive and causes the car to oscillate and spin.
+    # We reduce the proportional gains for lateral and heading error.
+    ControlledVehicle.K_LAT = 0.2
+    ControlledVehicle.K_HEADING = 0.2
 
     env = gym.make("lane-changing-v0", config=config, render_mode="human")
     base = env.unwrapped
 
     # --- Reset once ---
     obs, info = env.reset(seed=0)
+    base = env.unwrapped
+    from_n, to_n, lane_id = base.vehicle.lane_index
+    lanes = int(base.config.get("lanes_count", 4))
+    target_id = lane_id + 1 if lane_id + 1 < lanes else lane_id - 1
+    base.target_lane_index = (from_n, to_n, int(target_id))
+
+    print("START:", base.vehicle.lane_index, "TARGET:", base.target_lane_index)
+
 
     # Some of your reward functions rely on state variables existing:
     # start_time, prev_acceleration, prev_lat, lane_changing, target_lane_index
@@ -80,7 +95,7 @@ def main():
         base.lane_changing = False
 
     # --- Rollout parameters ---
-    n_steps = 100
+    n_steps = 300
     dt = 1.0 / float(base.config.get("policy_frequency", 15))
 
     # --- Aggregation ---
@@ -103,8 +118,20 @@ def main():
     # accel in [-1, 1], intent in [-1, 1]
     # We'll do a mild oscillation to create varied behavior.
     def sample_action(k):
-        accel = 0.2 * np.sin(0.05 * k)
-        intent = 0.8 if (k // 60) % 2 == 0 else -0.8
+        front_v, _, gapF, _ = base._vehicle_in_front_rear(base.vehicle.lane_index, max_range=200.0)
+
+        accel = 0.05
+        intent = 0.0
+
+        # If there is a lead car close and slower, request lane change
+        if front_v is not None:
+            closing = float(base.vehicle.speed - front_v.speed)
+            if gapF < 25.0 and closing > 1.0:
+                intent = 1.0
+        if k % 10 == 0:
+            x, y = base.vehicle.position
+            print("pos", (x, y), "heading", base.vehicle.heading)
+
         return np.array([accel, intent], dtype=np.float32)
 
     # --- Run rollout ---
@@ -113,13 +140,6 @@ def main():
         action = sample_action(k)
         obs, reward, terminated, truncated, info = env.step(action)
         env.render() # Ensure PyGame updates
-
-        # --- Update lane_changing flag for testing purposes ---
-        # (If you update it elsewhere in your env, remove this block.)
-        lane = base.road.network.get_lane(base.vehicle.lane_index)
-        _, lat = lane.local_coordinates(base.vehicle.position)
-        width = float(getattr(lane, "width", 4.0))
-        base.lane_changing = (abs(lat) > 0.5)  # your current heuristic
 
         # --- Context: neighbors + speeds ---
         curr_lane_index = base.vehicle.lane_index
@@ -183,6 +203,9 @@ def main():
                 f"| r_lim={pretty(float(speed_limit_term))} "
                 f"| r_succ={pretty(float(lane_success))} r_lc={pretty(float(lane_changing_term))}"
             )
+
+        if k % 5 == 0:
+            print("action_in_vehicle:", base.vehicle.action, "heading:", base.vehicle.heading)
 
         if terminated or truncated:
             print(f"[END] terminated={terminated} truncated={truncated} at step {k}")
