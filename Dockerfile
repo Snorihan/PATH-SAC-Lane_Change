@@ -1,34 +1,37 @@
-FROM python:3.10-slim
+# Use an official PyTorch image as a parent image.
+# This includes Python, CUDA, and cuDNN, suitable for deep learning tasks.
+FROM pytorch/pytorch:2.1.0-cuda12.1-cudnn8-devel
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_NO_CACHE_DIR=1 \
-    SDL_VIDEODRIVER=dummy \
-    MUJOCO_GL=osmesa
-
+# Set the working directory in the container
 WORKDIR /app
 
+# Install system-level dependencies required for rendering and video processing.
+# - git: For installing packages from git repositories.
+# - xvfb: A virtual framebuffer for running graphical applications (like the env renderer) without a display.
+# - ffmpeg: For recording videos of the environment.
+# - libgl1-mesa-glx: OpenGL library required by pygame for rendering.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    ffmpeg \
     git \
-    libgl1 \
+    xvfb \
+    ffmpeg \
     libgl1-mesa-glx \
-    libglib2.0-0 \
-    libosmesa6 \
-    libsdl2-2.0-0 \
-    libsdl2-image-2.0-0 \
-    libsdl2-mixer-2.0-0 \
-    libsdl2-ttf-2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY third_party/cleanrl ./third_party/cleanrl
-COPY requirements.txt ./
+# Copy the requirements file first to leverage Docker layer caching.
+# This layer is only rebuilt if requirements.txt changes.
+COPY requirements.txt .
 
-RUN python -m pip install --upgrade pip \
-    && python -m pip install --extra-index-url https://download.pytorch.org/whl/cu121 -r requirements.txt
+# Install Python dependencies.
+# Note: torch is already included in the base pytorch/pytorch image.
+RUN pip install --no-cache-dir -r requirements.txt
 
+# Copy the entire project source code into the container.
 COPY . .
 
-CMD ["bash"]
+# Add the project root to PYTHONPATH to ensure modules can be imported correctly.
+ENV PYTHONPATH="/app:${PYTHONPATH}"
+
+# Set the default command to run the SAC training script.
+# `xvfb-run` is used to provide a virtual display, which is often required by
+# rendering libraries like pygame, even for "rgb_array" mode.
+CMD ["xvfb-run", "-a", "python", "sac/thirdparty_cleanrl/sac_core.py", "--env-id", "lane-changing-v0"]

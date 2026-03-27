@@ -118,10 +118,11 @@ def main():
     # accel in [-1, 1], intent in [-1, 1]
     # We'll do a mild oscillation to create varied behavior.
     def sample_action(k):
+        '''This is for the scripted demo only. Obviously will be trained SAC model and not hardcoded levers in actuality'''
         front_v, _, gapF, _ = base._vehicle_in_front_rear(base.vehicle.lane_index, max_range=200.0)
 
         accel = 0.05
-        intent = 0.0
+        intent = 0.0 # this is our very basic sample script. Obviously we will not use this in actual training
 
         # If there is a lead car close and slower, request lane change
         if front_v is not None:
@@ -130,7 +131,7 @@ def main():
                 intent = 1.0
         if k % 10 == 0:
             x, y = base.vehicle.position
-            print("pos", (x, y), "heading", base.vehicle.heading)
+            # print("pos", (x, y), "heading", base.vehicle.heading)
 
         return np.array([accel, intent], dtype=np.float32)
 
@@ -204,8 +205,8 @@ def main():
                 f"| r_succ={pretty(float(lane_success))} r_lc={pretty(float(lane_changing_term))}"
             )
 
-        if k % 5 == 0:
-            print("action_in_vehicle:", base.vehicle.action, "heading:", base.vehicle.heading)
+        # if k % 5 == 0:
+            # print("action_in_vehicle:", base.vehicle.action, "heading:", base.vehicle.heading)
 
         if terminated or truncated:
             print(f"[END] terminated={terminated} truncated={truncated} at step {k}")
