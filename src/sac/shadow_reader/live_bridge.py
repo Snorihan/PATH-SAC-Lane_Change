@@ -181,9 +181,16 @@ class HighwayShadowBridge:
             normalized["cda"] = snapshot["cda"]
         return normalized
 
-    def _make_shadow_vehicle(self, lane_idx: int, pos_m: float, speed_mps: float) -> Vehicle | None:
+    def _make_shadow_vehicle(
+        self,
+        lane_idx: int,
+        pos_m: float,
+        speed_mps: float,
+        *,
+        total_lanes: int | None = None,
+    ) -> Vehicle | None:
         env = self.env
-        lanes = int(env.config.get("lanes_count", 4))
+        lanes = total_lanes if total_lanes is not None else int(env.config.get("lanes_count", 4))
         if lane_idx < 0 or lane_idx >= lanes:
             return None
 
@@ -203,18 +210,30 @@ class HighwayShadowBridge:
         lane_idx = int(ego["lane_idx"])
         pos_m = float(ego["pos_m"])
         surrounding = normalized.get("surrounding", {}) or {}
+        cda = normalized.get("cda", {}) or {}
 
+        # Prefer Aimsun's reported lane count; fall back to env config.
+        total_lanes = int(cda.get("totalLane") or self.env.config.get("lanes_count", 4))
+
+        # leftLCDir / rightLCDir: non-zero means the adjacent lane exists.
+        # Values from CDA: 1=left-turn lane, 2=through lane, 3=right-turn lane, 0=no lane.
+        left_lane_exists  = int(cda.get("leftLCDir",  0)) != 0 and lane_idx > 0
+        right_lane_exists = int(cda.get("rightLCDir", 0)) != 0 and lane_idx < total_lanes - 1
+
+        # (surrounding_key, neighbor_lane_idx, direction, place_if)
         specs = [
-            ("front", lane_idx, +1.0),
-            ("rear", lane_idx, -1.0),
-            ("llead", lane_idx - 1, +1.0),
-            ("llag", lane_idx - 1, -1.0),
-            ("rlead", lane_idx + 1, +1.0),
-            ("rlag", lane_idx + 1, -1.0),
+            ("front", lane_idx,     +1.0, True),
+            ("llead", lane_idx - 1, +1.0, left_lane_exists),
+            ("llag",  lane_idx - 1, -1.0, left_lane_exists),
+            ("rlead", lane_idx + 1, +1.0, right_lane_exists),
+            ("rlag",  lane_idx + 1, -1.0, right_lane_exists),
         ]
 
         neighbors: list[Vehicle] = []
-        for key, neighbor_lane_idx, direction in specs:
+        for key, neighbor_lane_idx, direction, place_if in specs:
+            if not place_if:
+                continue
+
             data = surrounding.get(key) or {}
             gap_m = data.get("gap_m")
             speed_mps = data.get("speed_mps")
@@ -230,6 +249,7 @@ class HighwayShadowBridge:
                 neighbor_lane_idx,
                 pos_m + direction * gap_m,
                 speed_mps,
+                total_lanes=total_lanes,
             )
             if vehicle is not None:
                 neighbors.append(vehicle)
