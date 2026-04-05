@@ -307,7 +307,8 @@ class LaneChangingEnv(HighwayEnv):
 
         reward = self._reward(action)
         terminated = bool(normalized.get("terminated", False) or self.vehicle.crashed)
-        truncated = bool(normalized.get("truncated", False))
+        max_steps = int(self.config.get("duration", 40) * self.config.get("policy_frequency", 15))
+        truncated = bool(normalized.get("truncated", False)) or (self.elapsed_steps >= max_steps)
         terminated = terminated or self._check_lane_change_termination()
 
         obs = self._observe_env()
@@ -337,7 +338,7 @@ class LaneChangingEnv(HighwayEnv):
     def reset(self, *args, **kwargs):
         obs, info = super().reset(*args, **kwargs)
 
-        if self.backend == "aimsun_live":
+        if getattr(self, "backend", "csv") == "aimsun_live":
             snapshot = self.live_bridge.require_connector().reset_episode(seed=kwargs.get("seed"))
             normalized = self.live_bridge.sync_shadow_state(snapshot)
             self._reset_episode_state()
@@ -349,8 +350,9 @@ class LaneChangingEnv(HighwayEnv):
             return obs, info
 
         scenario = None
-        if self.source is not None:
-            scenario = self.source.sample_initial_state(self.np_random)
+        source = getattr(self, "source", None)
+        if source is not None:
+            scenario = source.sample_initial_state(self.np_random)
 
         self._apply_initial_state(scenario, info)
         self._reset_episode_state()

@@ -333,6 +333,7 @@ class CdaLiveConnector(LiveConnector):
         dll.CDA_SetDebugMode.restype  = None
 
         # Ego vehicle getters  (egoID: int → double)
+        # Required — crash on missing
         for name in (
             "CDA_GetLatestVirVehTime",
             "CDA_GetVirVehSpeed",
@@ -349,7 +350,13 @@ class CdaLiveConnector(LiveConnector):
             "CDA_GetLatestTPTime",
             "CDA_GetRefAcc",
             "CDA_GetTPEndLoc",
-            # Neighbor / surrounding getters (egoID: int → double)
+        ):
+            fn           = getattr(dll, name)
+            fn.argtypes  = [_i]
+            fn.restype   = _d
+
+        # Neighbor / surrounding getters — optional: stub with 0.0 if not exported
+        for name in (
             "CDA_GetLeftLeadSpeed",
             "CDA_GetLeftLeadGap",
             "CDA_GetLeftLagSpeed",
@@ -362,23 +369,38 @@ class CdaLiveConnector(LiveConnector):
             "CDA_GetLeadGap",
             "CDA_GetDist2Turn",
         ):
-            fn           = getattr(dll, name)
-            fn.argtypes  = [_i]
-            fn.restype   = _d
+            try:
+                fn          = getattr(dll, name)
+                fn.argtypes = [_i]
+                fn.restype  = _d
+            except AttributeError:
+                # DLL predates lane-change getters — install a stub returning 0.0
+                setattr(dll, name, lambda *_: 0.0)
 
         # Integer getters (egoID: int → int)
+        # Required — crash on missing
         for name in (
             "CDA_GetSignalState",
-            "CDA_GetLeftLCDir",
-            "CDA_GetRightLCDir",
-            "CDA_GetTurnDir",
-            "CDA_GetLaneSpec",
             "CDA_GetCurVehLane",
             "CDA_GetTotalLane",
         ):
             fn           = getattr(dll, name)
             fn.argtypes  = [_i]
             fn.restype   = _i
+
+        # Optional integer getters — stub with 0 if not exported
+        for name in (
+            "CDA_GetLeftLCDir",
+            "CDA_GetRightLCDir",
+            "CDA_GetTurnDir",
+            "CDA_GetLaneSpec",
+        ):
+            try:
+                fn          = getattr(dll, name)
+                fn.argtypes = [_i]
+                fn.restype  = _i
+            except AttributeError:
+                setattr(dll, name, lambda *_: 0)
 
         # Elapsed time: no egoID, returns float (not double)
         dll.CDA_GetElapsedSec.argtypes = []
