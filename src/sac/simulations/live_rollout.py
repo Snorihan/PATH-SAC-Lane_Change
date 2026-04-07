@@ -2,12 +2,14 @@
 live_rollout.py — smoke-test the full live pipeline against a running Aimsun instance.
 
 What it does:
-  1. Connects to Aimsun via CdaLiveConnector (real DLL, real UDP).
+  1. Connects to Aimsun via AapiDirectConnector (pure Python, no DLL).
   2. Resets the episode and runs N steps with a trivial scripted policy.
   3. Prints reward terms every step so you can eyeball them.
 
 Usage (from src/sac/):
   python simulations/live_rollout.py
+
+To test without a real Aimsun, use simulated_test_rollout.py instead.
 
 Edit the CONFIG block below before running.
 """
@@ -19,17 +21,22 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))  # src/sac on path
 
 import lanechange_env  # noqa: F401 — registers lane-changing-v0
-from cda_live.cda_live_connector import CdaLiveConnector
+from cda_live.aapi_connector import AapiDirectConnector
 from lanechange_env import LaneChangingEnv
 
 # ── CONFIG — edit these before running ───────────────────────────────────────
 
-DLL_PATH    = r"C:\Users\janus\Desktop\BerkeleyFileMasterDirectory\PATH\Vehicle_Test_Interface\out\build\Release\Debug\CDA_Interface_Wrapper.dll"
 REMOTE_IP   = "127.0.0.1"
-REMOTE_PORT = 5555
-LOCAL_PORT  = 5556
-EGO_ID      = 1
+REMOTE_PORT = 8003   # Aimsun local_port  (Aimsun listens here)
+LOCAL_PORT  = 7999   # Aimsun server_port (Aimsun sends here)
+EGO_ID      = 1      # targetCAVID — must match a test vehicle in the Aimsun scenario
+LINK_ID     = -1     # !! SET THIS: Aimsun section ID where the ego starts.
+                     #    Find it in Aimsun: click the starting road section →
+                     #    Properties panel shows the internal ID.
 TIMEOUT_S   = 10.0
+
+INITIAL_POS_M     = 100.0   # starting position on section (metres)
+INITIAL_SPEED_MPS = 15.0    # starting speed (m/s)
 
 N_STEPS     = 200
 POLICY_HZ   = 15
@@ -69,14 +76,16 @@ def pretty(x) -> str:
 
 def main():
     print(f"[live_rollout] Connecting to Aimsun at {REMOTE_IP}:{REMOTE_PORT} ...")
-    connector = CdaLiveConnector({
-        "dll_path":        DLL_PATH,
-        "remote_ip":       REMOTE_IP,
-        "remote_port":     REMOTE_PORT,
-        "local_port":      LOCAL_PORT,
-        "ego_id":          EGO_ID,
-        "timeout_s":       TIMEOUT_S,
-        "poll_interval_s": 0.001,
+    connector = AapiDirectConnector({
+        "remote_ip":          REMOTE_IP,
+        "remote_port":        REMOTE_PORT,
+        "local_port":         LOCAL_PORT,
+        "ego_id":             EGO_ID,
+        "link_id":            LINK_ID,
+        "initial_pos_m":      INITIAL_POS_M,
+        "initial_speed_mps":  INITIAL_SPEED_MPS,
+        "timeout_s":          TIMEOUT_S,
+        "poll_interval_s":    0.001,
     })
 
     env = LaneChangingEnv(config={
@@ -100,6 +109,15 @@ def main():
 
         total_reward = 0.0
 
+        # Sanity-check: warn if the snapshot looks frozen.
+        # At 15 Hz policy vs 10 Hz Aimsun, ~1-2 repeated frames are normal.
+        # More than FREEZE_WARN_STEPS identical (pos, speed) frames in a row
+        # almost certainly means Aimsun isn't broadcasting or the ego ID is wrong.
+        FREEZE_WARN_STEPS = 5
+        _freeze_count  = 0
+        _prev_pos_m    = None
+        _prev_speed    = None
+
         for step in range(N_STEPS):
             action = sample_action(env)
             obs, reward, terminated, truncated, info = env.step(action)
@@ -108,6 +126,22 @@ def main():
             rt = info.get("reward_terms", {})
             lcs = info.get("lane_change_state", {})
             snap_ego = info.get("snapshot", {}).get("ego", {})
+
+            cur_pos   = snap_ego.get("pos_m")
+            cur_speed = snap_ego.get("speed_mps")
+            if cur_pos == _prev_pos_m and cur_speed == _prev_speed:
+                _freeze_count += 1
+                if _freeze_count == FREEZE_WARN_STEPS:
+                    print(
+                        f"[WARN] snapshot frozen for {_freeze_count} consecutive steps "
+                        f"(pos_m={cur_pos}, speed_mps={cur_speed}).  "
+                        f"Check: (1) Aimsun is running and broadcasting, "
+                        f"(2) EGO_ID={EGO_ID} matches the virtual vehicle in Aimsun."
+                    )
+            else:
+                _freeze_count = 0
+            _prev_pos_m = cur_pos
+            _prev_speed = cur_speed
 
             print(
                 f"step {step:03d} | "

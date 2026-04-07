@@ -114,6 +114,16 @@ class CdaLiveConnector(LiveConnector):
             self._cached_snapshot = None
         self._first_frame_event.clear()
 
+        # In debug mode the DLL generates fake inbound data inside sendMessage().
+        # Reset never calls sendMessage, so prime it with a dummy send now.
+        if self._debug_mode:
+            self._dll.CDA_SendMessage(
+                ctypes.c_int(self._ego_id),
+                ctypes.c_double(0.0),  # pos
+                ctypes.c_double(0.0),  # speed
+                ctypes.c_int(1),       # lane (wire, 1-based)
+            )
+
         # Block until the reader thread delivers the first frame.
         if not self._first_frame_event.wait(timeout=self._timeout_s):
             raise TimeoutError(
@@ -195,7 +205,7 @@ class CdaLiveConnector(LiveConnector):
         eid = ctypes.c_int(self._ego_id)
         while not self._closed:
             vir_time = float(self._dll.CDA_GetLatestVirVehTime(eid))
-            if vir_time != 0.0 and vir_time != self._last_vir_time:
+            if vir_time > 0.0 and vir_time != self._last_vir_time:
                 self._last_vir_time = vir_time
                 snapshot = self._build_snapshot(eid=eid, dt=self.AIMSUN_DT)
                 with self._lock:
