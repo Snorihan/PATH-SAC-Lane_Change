@@ -50,7 +50,7 @@ _END    = 6
 #   rightLagSpeed(h)  rightLagGap(i)
 #   leadSpeed(h) leadGap(i)
 #   currentLane(b) totalLane(b)
-_FMT  = "<hhhhhbbbbbhiihibibhhihihihihihibb"
+_FMT  = "<hhhhhbbbbbhiihibhhbhihihihihibb"
 _SIZE = struct.calcsize(_FMT)   # 69 bytes
 
 _FIELDS = [
@@ -63,7 +63,6 @@ _FIELDS = [
     "rightLeadSpeed","rightLeadGap",
     "rightLagSpeed", "rightLagGap",
     "leadSpeed",     "leadGap",
-    "rearSpeed",     "rearGap",
     "currentLane",   "totalLane",
 ]
 _IDX = {name: i for i, name in enumerate(_FIELDS)}
@@ -102,8 +101,6 @@ def _pack(fields: dict) -> bytes:
         g("rightLagGap",   -1),
         g("leadSpeed",     -1),
         g("leadGap",       -1),
-        g("rearSpeed",     -1),
-        g("rearGap",       -1),
         g("currentLane",   -1),
         g("totalLane",     -1),
     )
@@ -152,7 +149,8 @@ class AapiDirectConnector(LiveConnector):
         self._remote_port = int(config.get("remote_port", 8003))
         self._local_port  = int(config.get("local_port",  7999))
         self._ego_id      = int(config.get("ego_id",      1))
-        self._link_id     = int(config["link_id"])          # required
+        self._link_id      = int(config["link_id"])           # required
+        self._next_link_id = int(config["next_link_id"])    # required — section downstream of link_id
         self._max_speed   = float(config.get("max_speed_mps",      40.0))
         self._timeout_s   = float(config.get("timeout_s",          10.0))
         self._poll_s      = float(config.get("poll_interval_s",    0.001))
@@ -281,7 +279,7 @@ class AapiDirectConnector(LiveConnector):
             "linkPos":     pos_raw,
             "laneID":      lane,
             "nodeID":      -1,
-            "nextLinkID":  -1,
+            "nextLinkID":  self._next_link_id,
             "stringPos":   1,
         })
         try:

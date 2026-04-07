@@ -156,6 +156,7 @@ def main():
         "local_port":        local_port,
         "ego_id":            EGO_ID,
         "link_id":           1,
+        "next_link_id":      2,
         "initial_pos_m":     INITIAL_POS_M,
         "initial_speed_mps": INITIAL_SPEED_MPS,
         "timeout_s":         5.0,

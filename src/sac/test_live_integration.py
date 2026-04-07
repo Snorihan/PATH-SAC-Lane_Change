@@ -167,6 +167,7 @@ def _make_connector_and_server(
         "local_port":        local_port,
         "ego_id":            ego_id,
         "link_id":           1,
+        "next_link_id":      2,
         "initial_pos_m":     _EGO_POS_M,
         "initial_speed_mps": _EGO_SPEED_MPS,
         "timeout_s":         5.0,

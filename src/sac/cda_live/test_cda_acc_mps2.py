@@ -141,6 +141,7 @@ def _make(
         "local_port":        local_port,
         "ego_id":            ego_id,
         "link_id":           1,
+        "next_link_id":      2,
         "initial_pos_m":     100.0,
         "initial_speed_mps": initial_speed,
         "max_speed_mps":     40.0,
