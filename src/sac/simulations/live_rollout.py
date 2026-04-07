@@ -30,9 +30,10 @@ REMOTE_IP   = "127.0.0.1"
 REMOTE_PORT = 8003   # Aimsun local_port  (Aimsun listens here)
 LOCAL_PORT  = 7999   # Aimsun server_port (Aimsun sends here)
 EGO_ID      = 1      # targetCAVID — must match a test vehicle in the Aimsun scenario
-LINK_ID     = -1     # !! SET THIS: Aimsun section ID where the ego starts.
-                     #    Find it in Aimsun: click the starting road section →
-                     #    Properties panel shows the internal ID.
+LINK_ID      = 3028   # Aimsun section ID where the ego starts.
+NEXT_LINK_ID = 3029     # !! SET THIS: section immediately downstream of LINK_ID.
+                      #    In Aimsun: follow the road forward one section →
+                      #    click it → Properties panel shows the internal ID.
 TIMEOUT_S   = 10.0
 
 INITIAL_POS_M     = 100.0   # starting position on section (metres)
@@ -82,6 +83,7 @@ def main():
         "local_port":         LOCAL_PORT,
         "ego_id":             EGO_ID,
         "link_id":            LINK_ID,
+        "next_link_id":       NEXT_LINK_ID,
         "initial_pos_m":      INITIAL_POS_M,
         "initial_speed_mps":  INITIAL_SPEED_MPS,
         "timeout_s":          TIMEOUT_S,
