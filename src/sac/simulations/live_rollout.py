@@ -42,7 +42,7 @@ INITIAL_SPEED_MPS = 15.0    # starting speed (m/s)
 N_STEPS     = 200
 POLICY_HZ   = 15
 DURATION_S  = 40
-LANES       = 4
+LANES       = 1
 SPEED_LIMIT = 30.0   # m/s — set to None to disable speed-limit reward term
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -111,39 +111,34 @@ def main():
 
         total_reward = 0.0
 
-        # Sanity-check: warn if the snapshot looks frozen.
-        # At 15 Hz policy vs 10 Hz Aimsun, ~1-2 repeated frames are normal.
-        # More than FREEZE_WARN_STEPS identical (pos, speed) frames in a row
-        # almost certainly means Aimsun isn't broadcasting or the ego ID is wrong.
+        # Sanity-check: warn when Aimsun's simTime stops advancing.
+        # simTime freezing means the placeholder vehicle was lost — Aimsun is no
+        # longer sending surrounding state.  pos_m / speed_mps are locally
+        # computed by the connector so they always advance; checking them here
+        # would miss the real problem.
+        # At 15 Hz policy vs 10 Hz Aimsun, 1-2 stale frames per step are normal.
         FREEZE_WARN_STEPS = 5
-        _freeze_count  = 0
-        _prev_pos_m    = None
-        _prev_speed    = None
 
         for step in range(N_STEPS):
             action = sample_action(env)
             obs, reward, terminated, truncated, info = env.step(action)
             total_reward += reward
 
-            rt = info.get("reward_terms", {})
-            lcs = info.get("lane_change_state", {})
-            snap_ego = info.get("snapshot", {}).get("ego", {})
+            rt   = info.get("reward_terms", {})
+            lcs  = info.get("lane_change_state", {})
+            snap = info.get("snapshot", {})
+            snap_ego = snap.get("ego", {})
 
-            cur_pos   = snap_ego.get("pos_m")
-            cur_speed = snap_ego.get("speed_mps")
-            if cur_pos == _prev_pos_m and cur_speed == _prev_speed:
-                _freeze_count += 1
-                if _freeze_count == FREEZE_WARN_STEPS:
-                    print(
-                        f"[WARN] snapshot frozen for {_freeze_count} consecutive steps "
-                        f"(pos_m={cur_pos}, speed_mps={cur_speed}).  "
-                        f"Check: (1) Aimsun is running and broadcasting, "
-                        f"(2) EGO_ID={EGO_ID} matches the virtual vehicle in Aimsun."
-                    )
-            else:
-                _freeze_count = 0
-            _prev_pos_m = cur_pos
-            _prev_speed = cur_speed
+            stale = snap.get("aimsun_stale_steps", 0)
+            if stale == FREEZE_WARN_STEPS:
+                print(
+                    f"[WARN] Aimsun sim_time frozen for {stale} consecutive steps "
+                    f"(sim_time={snap.get('time_s')}).  "
+                    f"Placeholder vehicle lost — ego will not receive surrounding state.  "
+                    f"Check: (1) warm-up traffic exists on LINK_ID={LINK_ID}, "
+                    f"(2) EGO_ID={EGO_ID} is correct, "
+                    f"(3) LINK_ID={LINK_ID} / NEXT_LINK_ID={NEXT_LINK_ID} are correct."
+                )
 
             print(
                 f"step {step:03d} | "

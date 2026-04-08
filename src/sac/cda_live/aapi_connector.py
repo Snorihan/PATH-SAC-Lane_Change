@@ -165,6 +165,12 @@ class AapiDirectConnector(LiveConnector):
         self._lane_wire   = self._init_lane
         self._prev_speed  = self._init_speed
 
+        # Stale-frame tracking: counts consecutive step() calls where Aimsun's
+        # simTime did not advance.  A non-zero count means Aimsun is not
+        # sending back surrounding state — placeholder likely lost or absent.
+        self._stale_steps   = 0
+        self._step_sim_time = -1.0
+
         # Shared state between reader thread and policy thread.
         self._lock                = threading.Lock()
         self._cached_snapshot: dict | None = None
@@ -194,6 +200,8 @@ class AapiDirectConnector(LiveConnector):
             self._prev_speed  = self._init_speed
             self._cached_snapshot = None
             self._last_sim_time   = -1.0
+            self._stale_steps     = 0
+            self._step_sim_time   = -1.0
         self._first_frame_event.clear()
 
         # Bootstrap: send ego state so Aimsun creates the placeholder vehicle.
@@ -202,9 +210,12 @@ class AapiDirectConnector(LiveConnector):
         if not self._first_frame_event.wait(timeout=self._timeout_s):
             raise TimeoutError(
                 f"AapiDirectConnector: no START1 frame within {self._timeout_s}s. "
-                "Check: (1) Aimsun simulation is running, "
-                f"(2) a vehicle of test type is in the scenario, "
-                f"(3) link_id={self._link_id} is correct."
+                f"Aimsun did not create a placeholder vehicle on link_id={self._link_id}. "
+                "Check: (1) Aimsun simulation is running and past warm-up time "
+                "(background traffic must already exist on the section), "
+                f"(2) link_id={self._link_id} / next_link_id={self._next_link_id} are correct "
+                "(section IDs from Aimsun Properties panel), "
+                f"(3) ego_id={self._ego_id} matches a test vehicle type in the scenario."
             )
 
         with self._lock:
@@ -239,6 +250,17 @@ class AapiDirectConnector(LiveConnector):
             snap["ego"]["acc_mps2"]  = acc
             snap["ego"]["speed_mps"] = new_speed
             snap["ego"]["pos_m"]     = new_pos
+
+        # Detect placeholder loss: if Aimsun's simTime hasn't advanced, the
+        # placeholder vehicle is gone and surrounding data is stale.
+        cur_sim_time = snap.get("time_s", -1.0)
+        if cur_sim_time == self._step_sim_time:
+            self._stale_steps += 1
+        else:
+            self._stale_steps   = 0
+            self._step_sim_time = cur_sim_time
+        snap["aimsun_stale_steps"] = self._stale_steps
+
         return snap
 
     def close(self) -> None:
