@@ -364,7 +364,7 @@ class AapiDirectConnector(LiveConnector):
             return raw * 0.01 if raw > 0 else None   # 0.01 m/s scale
 
         def gap(raw: int) -> float | None:
-            return raw * 0.1  if raw > 0 else None   # 0.1 m scale
+            return None if raw == 0 else raw * 0.1   # 0 = no vehicle; negative = overlap/crash
 
         return {
             "ego": {

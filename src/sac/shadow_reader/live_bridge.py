@@ -84,7 +84,13 @@ class HighwayShadowBridge:
         env.vehicle.target_lane_index = lane_index
         env.vehicle.target_speed = speed_mps
         env.vehicle.action = {"acceleration": acc_mps2}
-        env.vehicle.crashed = bool(ego.get("crashed", False))
+        surrounding = normalized.get("surrounding", {})
+        _gaps = [
+            (surrounding.get(k) or {}).get("gap_m")
+            for k in ("front", "llead", "llag", "rlead", "rlag")
+        ]
+        gap_crash = any(g is not None and g < 0 for g in _gaps)
+        env.vehicle.crashed = bool(ego.get("crashed", False)) or gap_crash
 
         shadow_vehicles = [env.vehicle]
         explicit_neighbors = normalized.get("neighbors", []) or []

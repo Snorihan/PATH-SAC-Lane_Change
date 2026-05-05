@@ -2,7 +2,7 @@
 live_rollout.py — smoke-test the full live pipeline against a running Aimsun instance.
 
 What it does:
-  1. Connects to Aimsun via AapiDirectConnector (pure Python, no DLL).
+  1. Connects to the HIL Tool via HilConnector (START2/MSGEND framed UDP).
   2. Resets the episode and runs N steps with a trivial scripted policy.
   3. Prints reward terms every step so you can eyeball them.
 
@@ -21,19 +21,15 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))  # src/sac on path
 
 import lanechange_env  # noqa: F401 — registers lane-changing-v0
-from cda_live.aapi_connector import AapiDirectConnector
+from cda_live.cda_hil_connector import HilConnector
 from lanechange_env import LaneChangingEnv
 
 # ── CONFIG — edit these before running ───────────────────────────────────────
 
-REMOTE_IP   = "127.0.0.1"
-REMOTE_PORT = 8003   # Aimsun local_port  (Aimsun listens here)
-LOCAL_PORT  = 7999   # Aimsun server_port (Aimsun sends here)
-EGO_ID      = 1      # targetCAVID — must match a test vehicle in the Aimsun scenario
-LINK_ID      = 3028   # Aimsun section ID where the ego starts.
-NEXT_LINK_ID = 3029     # !! SET THIS: section immediately downstream of LINK_ID.
-                      #    In Aimsun: follow the road forward one section →
-                      #    click it → Properties panel shows the internal ID.
+HIL_IP     = "127.0.0.1"
+HIL_PORT   = 7999   # HIL Tool listens here (same port Aimsun used to use)
+LOCAL_PORT = 7998   # Python listens here; HIL Tool sends back to this port
+EGO_ID     = 1      # Test vehicle ID — must match HIL Tool vehicle config
 TIMEOUT_S   = 10.0
 
 INITIAL_POS_M     = 100.0   # starting position on section (metres)
@@ -76,14 +72,12 @@ def pretty(x) -> str:
 
 
 def main():
-    print(f"[live_rollout] Connecting to Aimsun at {REMOTE_IP}:{REMOTE_PORT} ...")
-    connector = AapiDirectConnector({
-        "remote_ip":          REMOTE_IP,
-        "remote_port":        REMOTE_PORT,
+    print(f"[live_rollout] Connecting to HIL Tool at {HIL_IP}:{HIL_PORT} ...")
+    connector = HilConnector({
+        "hil_ip":             HIL_IP,
+        "hil_port":           HIL_PORT,
         "local_port":         LOCAL_PORT,
         "ego_id":             EGO_ID,
-        "link_id":            LINK_ID,
-        "next_link_id":       NEXT_LINK_ID,
         "initial_pos_m":      INITIAL_POS_M,
         "initial_speed_mps":  INITIAL_SPEED_MPS,
         "timeout_s":          TIMEOUT_S,
@@ -102,7 +96,7 @@ def main():
     })
 
     try:
-        print("[live_rollout] Waiting for first Aimsun frame (reset) ...")
+        print("[live_rollout] Waiting for first HIL Tool frame (reset) ...")
         obs, info = env.reset()
         print(f"[live_rollout] Reset OK  lane={env.vehicle.lane_index}  "
               f"speed={env.vehicle.speed:.1f} m/s  "
@@ -111,12 +105,12 @@ def main():
 
         total_reward = 0.0
 
-        # Sanity-check: warn when Aimsun's simTime stops advancing.
-        # simTime freezing means the placeholder vehicle was lost — Aimsun is no
-        # longer sending surrounding state.  pos_m / speed_mps are locally
-        # computed by the connector so they always advance; checking them here
-        # would miss the real problem.
-        # At 15 Hz policy vs 10 Hz Aimsun, 1-2 stale frames per step are normal.
+        # Sanity-check: warn when the HIL Tool stops sending new frames.
+        # The HIL Tool timestamp freezing means Aimsun paused or the test
+        # vehicle was de-registered.  pos_m / speed_mps are locally computed
+        # by the connector so they always advance; checking them here would
+        # miss the real problem.
+        # At 15 Hz policy vs 10 Hz HIL Tool, 1-2 stale frames per step are normal.
         FREEZE_WARN_STEPS = 5
 
         for step in range(N_STEPS):
@@ -132,12 +126,12 @@ def main():
             stale = snap.get("aimsun_stale_steps", 0)
             if stale == FREEZE_WARN_STEPS:
                 print(
-                    f"[WARN] Aimsun sim_time frozen for {stale} consecutive steps "
-                    f"(sim_time={snap.get('time_s')}).  "
-                    f"Placeholder vehicle lost — ego will not receive surrounding state.  "
-                    f"Check: (1) warm-up traffic exists on LINK_ID={LINK_ID}, "
-                    f"(2) EGO_ID={EGO_ID} is correct, "
-                    f"(3) LINK_ID={LINK_ID} / NEXT_LINK_ID={NEXT_LINK_ID} are correct."
+                    f"[WARN] HIL Tool timestamp frozen for {stale} consecutive steps "
+                    f"(time_s={snap.get('time_s')}).  "
+                    f"Ego will not receive updated surrounding state.  "
+                    f"Check: (1) Aimsun simulation is running and not paused, "
+                    f"(2) EGO_ID={EGO_ID} is registered in HIL Tool config, "
+                    f"(3) HIL Tool is sending to local_port={LOCAL_PORT}."
                 )
 
             print(

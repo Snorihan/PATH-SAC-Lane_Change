@@ -93,7 +93,7 @@ class IntentContinuousAction(ActionType):
         )
 
     def act(self, action):
-        self.env._send_action(action)
+        self.env._send_action(action)   
 
 
 # ── Env registration (guarded) ────────────────────────────────────────────────
@@ -112,23 +112,27 @@ class LaneChangingEnv(HighwayEnv):
     @classmethod
     def default_config(cls) -> dict:
         config = super().default_config()
-        config.update({
-            "backend":    "csv",   # options: "csv" | "aimsun_live"
-            "scenario_csv": None,
-            "live_connector": None,
-            "live_connector_factory": None,
-            "rewards": {
-                "collision":                               -500.0,
-                "lane_success":                              50.0,
-                "jerk_weight":                               5.0,
-                "dist_relative_to_nearby_vehicles_weight": 100.0,
-                "speed_relative_to_nearby_vehicles_weight": 10.0,
-                "follow_spd_lmt_weight":                     1.0,
-                "lane_changing_weight":                      5.0,
-            },
-            "duration_after_lane_change":  80,
-            "duration_before_lane_change": 40,
-            "lane_change_lat_threshold":   0.5,
+        config.update(rewards = {
+            # Safety
+            "collision_penalty": -500.0,
+            "ttc_weight": 80.0,
+            "gap_weight": 40.0,
+            "closing_speed_weight": 15.0,
+
+            # Lane change task
+            "lane_success": 80.0,
+            "lane_progress_weight": 20.0,
+            "lane_start_bonus": 5.0,
+            "lane_keeping_penalty_when_requested": 0.2,
+            "wrong_lane_penalty": 5.0,
+
+            # Comfort
+            "jerk_weight": 2.0,
+            "lat_accel_weight": 1.0,
+
+            # Rules / efficiency
+            "speed_limit_weight": 1.0,
+            "time_penalty": 0.05,
         })
         return config
 
@@ -187,6 +191,7 @@ class LaneChangingEnv(HighwayEnv):
         self.elapsed_steps = 0
         self.last_jerk_value = 0.0
         self.prev_reward_time = float(getattr(self, "time", 0.0))
+        self.started_lane_change = False
 
         self.start_lane_index = self.vehicle.lane_index
         self.ultimate_target_lane_index = self.find_target_lane(self.start_lane_index)
@@ -218,47 +223,60 @@ class LaneChangingEnv(HighwayEnv):
         curr_acc   = float(veh_action.get("acceleration", 0.0))
 
         terms = [
+            # Safety: sparse collision penalty (paper eq.1)
             RewardTerm(
                 name   = "collision",
                 fn     = lambda: 1.0 if self.vehicle.crashed else 0.0,
-                weight = w["collision"],
+                weight = w["collision_penalty"],
                 sign   = +1.0,
             ),
+            # Safety: dense TTC penalty — 1/TTC for each vehicle within threshold (paper eq.3)
+            RewardTerm(
+                name   = "ttc",
+                fn     = self._r_fn_ttc,
+                weight = w["ttc_weight"],
+                sign   = -1.0,
+            ),
+            # Comfort: penalize jerk; small reward for smooth driving
             RewardTerm(
                 name   = "jerk",
-                fn     = lambda: abs(self._reward_funct_jerk(self.time, curr_acc)) - 0.5,
+                fn     = lambda: max(0.0, (self._reward_funct_jerk(self.time, curr_acc)) - 0.5),
                 weight = w["jerk_weight"],
                 sign   = -1.0,
             ),
-            RewardTerm(
-                name   = "speed",
-                fn     = self._r_fn_relative_speeds,
-                weight = w["speed_relative_to_nearby_vehicles_weight"],
-                sign   = +1.0,
-            ),
-            RewardTerm(
-                name   = "dist",
-                fn     = self._r_fn_relative_distance,
-                weight = w["dist_relative_to_nearby_vehicles_weight"],
-                sign   = +1.0,
-            ),
+            # Rules: reward speed up to limit, penalize exceeding it
             RewardTerm(
                 name   = "speed_limit",
                 fn     = self._r_fn_matching_speed_limit,
-                weight = w["follow_spd_lmt_weight"],
+                weight = w["speed_limit_weight"],
                 sign   = +1.0,
             ),
+            # Progress: lateral progress toward target lane + one-time start bonus
+            RewardTerm(
+                name   = "lane_start",
+                fn     = self._r_fn_lane_start,
+                weight = w["lane_start_bonus"],
+                sign   = +1.0,
+            ),
+            RewardTerm(
+                name   = "lc_progress",
+                fn     = self._r_fn_lc_progress,
+                weight = w["lane_progress_weight"],
+                sign   = +1.0,
+            ),
+            # Progress: sparse reward for reaching target lane
             RewardTerm(
                 name   = "lane_success",
                 fn     = lambda: self._r_fn_lane_change_success(self.vehicle.lane_index),
                 weight = w["lane_success"],
                 sign   = +1.0,
             ),
+            # Efficiency: small per-step penalty to discourage stalling
             RewardTerm(
-                name   = "lane_changing",
-                fn     = self._r_fn_lane_changing,
-                weight = w["lane_changing_weight"],
-                sign   = +1.0,
+                name   = "time_penalty",
+                fn     = lambda: 1.0,
+                weight = w["time_penalty"],
+                sign   = -1.0,
             ),
         ]
 
@@ -337,6 +355,8 @@ class LaneChangingEnv(HighwayEnv):
 
     def reset(self, *args, **kwargs):
         obs, info = super().reset(*args, **kwargs)
+        self.prev_lane_progress = 0.0
+        self.got_lane_success = False
 
         if getattr(self, "backend", "csv") == "aimsun_live":
             snapshot = self.live_bridge.require_connector().reset_episode(seed=kwargs.get("seed"))
@@ -357,6 +377,7 @@ class LaneChangingEnv(HighwayEnv):
         self._apply_initial_state(scenario, info)
         self._reset_episode_state()
         obs = self._observe_env()
+
         return obs, info
 
     def _apply_initial_state(self, scenario: dict | None, info: dict) -> None:
@@ -479,34 +500,32 @@ class LaneChangingEnv(HighwayEnv):
         self.prev_acceleration = curr_acc
         return jerk
 
-    def _r_fn_relative_distance(self, min_gap: float = 20.0, max_gap: float = 100.0):
-        sv = self._get_surrounding_vehicles()
-        r  = 0.0
-        if sv.front_gap < min_gap:
-            r -= min_gap - sv.front_gap
-        if sv.rear_gap < min_gap:
-            r -= min_gap - sv.rear_gap
-        if sv.front_gap >= max_gap and sv.rear_gap >= min_gap:
-            r = 0.0
+    def _r_fn_ttc(self, ttc_threshold: float = 3.0) -> float:
+        """Dense safety penalty: bounded risk of 1/TTC for each neighbor within threshold."""
+        sv      = self._get_surrounding_vehicles()
+        ego_spd = float(self.vehicle.speed)
+        r       = 0.0
+        # (gap_m, vehicle, ego_is_approaching)
+        pairs = [
+            (sv.front_gap,  sv.front_v,  True),
+            (sv.rear_gap,   sv.rear_v,   False),
+            (sv.llead_gap,  sv.llead_v,  True),
+            (sv.llag_gap,   sv.llag_v,   False),
+            (sv.rlead_gap,  sv.rlead_v,  True),
+            (sv.rlag_gap,   sv.rlag_v,   False),
+        ]
+        for gap, veh, ego_closing in pairs:
+            if veh is None or gap >= float("inf"):
+                continue
+            v_spd   = float(veh.speed)
+            closing = (ego_spd - v_spd) if ego_closing else (v_spd - ego_spd)
+            if closing <= 0.0:
+                continue
+            ttc = gap / closing
+            if ttc < ttc_threshold:
+                risk = ((ttc_threshold - ttc) / ttc_threshold) ** 2
+                r = max(r, risk)
         return r
-
-    def _r_fn_relative_speeds(self, max_range: float = 200.0):
-        """Penalize unsafe closing speeds front and rear."""
-        ego_speed = float(self.vehicle.speed)
-        sv = self._get_surrounding_vehicles(max_range)
-        r  = 0.0
-
-        if sv.front_v is not None and sv.front_gap <= max_range:
-            closing = ego_speed - float(sv.front_v.speed)
-            if closing > 0.0:
-                r -= closing
-
-        if sv.rear_v is not None and sv.rear_gap <= max_range:
-            rear_closing = float(sv.rear_v.speed) - ego_speed
-            if rear_closing > 0.0:
-                r -= rear_closing
-
-        return float(r)
 
     def _r_fn_matching_speed_limit(self):
         speed_limit = self.config.get("speed_limit", None)
@@ -519,35 +538,54 @@ class LaneChangingEnv(HighwayEnv):
         return -(ego_speed - speed_limit)
 
     def _r_fn_lane_change_success(self, curr_lane_index):
-        return 1 if self._same_lane(curr_lane_index, self.target_lane_index) else 0
+        if self._same_lane(curr_lane_index, self.target_lane_index) and not self.got_lane_success:
+            self.got_lane_success = True
+            return 1
+        else:
+            return 0
 
-    def _r_fn_lane_changing(self):
-        if not self.lane_changing:
+    def _r_fn_lc_progress(self) -> float:
+        _, _, curr_id = self.vehicle.lane_index
+        _, _, target_id = self.target_lane_index
+
+        if curr_id == target_id:
+            self.prev_lane_progress = 1.0
             return 0.0
 
-        lane       = self.road.network.get_lane(self.vehicle.lane_index)
-        width      = float(getattr(lane, "width", 4.0))
-        half_width = 0.5 * width
-        _, lat     = lane.local_coordinates(self.vehicle.position)
-        progress   = min(abs(lat) / max(half_width, 1e-6), 1.0)
+        lane = self.road.network.get_lane(self.vehicle.lane_index)
+        _, lat = lane.local_coordinates(self.vehicle.position)
+        width = float(getattr(lane, "width", 4.0))
 
-        dt       = 1.0 / float(self.config.get("policy_frequency", 15))
-        prev_lat = float(getattr(self, "prev_lat", lat))
-        v_lat    = (lat - prev_lat) / dt
-        self.prev_lat = float(lat)
+        direction = float(np.sign(target_id - curr_id))
+        progress_now = float(np.clip(lat * direction / max(width * 0.5, 1e-6), 0.0, 1.0))
 
-        v_lat_th = 0.05 * width
-        if abs(v_lat) < v_lat_th:
+        delta_progress = max(0.0, progress_now - self.prev_lane_progress)
+        self.prev_lane_progress = progress_now
+
+        return delta_progress
+
+    def _r_fn_lane_start(self) -> float:
+        if self.started_lane_change:
             return 0.0
 
-        veh_action = getattr(self.vehicle, "action", {}) or {}
-        a_long     = float(veh_action.get("acceleration", 0.0))
+        _, _, curr_id = self.vehicle.lane_index
+        _, _, target_id = self.target_lane_index
 
-        early      = (progress < 0.5)
-        acc_reward = max(a_long, 0.0) if early else max(-a_long, 0.0)
-        vel_reward = min(abs(v_lat) / max(v_lat_th, 1e-6), 2.0)
-        return float(vel_reward + acc_reward)
+        if curr_id == target_id:
+            return 0.0
 
+        lane = self.road.network.get_lane(self.vehicle.lane_index)
+        _, lat = lane.local_coordinates(self.vehicle.position)
+        width = float(getattr(lane, "width", 4.0))
+
+        direction = float(np.sign(target_id - curr_id))
+        progress_now = float(np.clip(lat * direction / max(width * 0.5, 1e-6), 0.0, 1.0))
+
+        if progress_now > 0.05:
+            self.started_lane_change = True
+            return 1.0
+
+        return 0.0
     # ── Legacy ────────────────────────────────────────────────────────────────
 
     def _sample_scenario(self):
