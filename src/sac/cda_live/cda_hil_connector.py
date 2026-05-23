@@ -163,9 +163,10 @@ class HilConnector(LiveConnector):
         self._timeout_s  = float(config.get("timeout_s",       10.0))
         self._poll_s     = float(config.get("poll_interval_s", 0.001))
 
-        self._init_pos_m = float(config.get("initial_pos_m",     100.0))
-        self._init_speed = float(config.get("initial_speed_mps",  15.0))
-        self._init_lane  = int(config.get("initial_lane",           1))   # 1-based wire
+        self._init_pos_m       = float(config.get("initial_pos_m",     100.0))
+        self._init_speed       = float(config.get("initial_speed_mps",  15.0))
+        self._init_lane        = int(config.get("initial_lane",           1))   # 1-based wire
+        self._teleport_on_reset = bool(config.get("teleport_on_reset",  True))
 
         # Ego kinematics — Python-maintained, sent to HIL Tool each step.
         self._pos_m      = self._init_pos_m
@@ -202,10 +203,11 @@ class HilConnector(LiveConnector):
 
     def reset_episode(self, seed=None) -> dict[str, Any]:
         with self._lock:
-            self._pos_m      = self._init_pos_m
-            self._speed_mps  = self._init_speed
-            self._lane_wire  = self._init_lane
-            self._prev_speed = self._init_speed
+            if self._teleport_on_reset:
+                self._pos_m      = self._init_pos_m
+                self._speed_mps  = self._init_speed
+                self._lane_wire  = self._init_lane
+                self._prev_speed = self._init_speed
             self._cached_snapshot = None
             self._last_time_s     = -1.0
             self._stale_steps     = 0
@@ -226,6 +228,10 @@ class HilConnector(LiveConnector):
 
         with self._lock:
             snapshot = dict(self._cached_snapshot)
+            # Sync lane to whatever the HIL Tool reports so _lane_wire
+            # always reflects the car's actual lane, not the hardcoded init value.
+            reported_lane_idx = int(snapshot["ego"]["lane_idx"])   # 0-based
+            self._lane_wire = reported_lane_idx + 1                # → 1-based wire
         snapshot["ego"] = dict(snapshot["ego"])
         snapshot["ego"]["acc_mps2"] = 0.0
         return snapshot
@@ -246,7 +252,7 @@ class HilConnector(LiveConnector):
             self._pos_m      = new_pos
             self._lane_wire  = new_lane
 
-        acc = (new_speed - prev) / self.HIL_DT
+        acc = (new_speed - prev) / dt if dt > 1e-9 else accel_mps2
 
         self._send_ego_state()
 
@@ -269,6 +275,36 @@ class HilConnector(LiveConnector):
         snap["aimsun_stale_steps"] = self._stale_steps
 
         return snap
+
+    def get_total_lanes(self) -> int:
+        """Block until the first HIL frame arrives and return totalLane.
+        Call this before constructing the env so lanes_count is correct.
+        reset_episode() will still work — it clears the event and waits for a fresh frame."""
+        self._send_ego_state()
+        if not self._first_frame_event.wait(timeout=self._timeout_s):
+            return 4  # fallback if HIL Tool doesn't respond in time
+        with self._lock:
+            snap = self._cached_snapshot
+        return int((snap.get("cda") or {}).get("totalLane") or 4)
+
+    def idle(self, hz: float = 10.0) -> None:
+        """Keep sending ego state so the HIL dashboard stays alive after training ends.
+        Integrates position at the last known speed (constant velocity) so the
+        vehicle keeps moving on the dashboard rather than freezing in place.
+        Blocks until KeyboardInterrupt (Ctrl+C).
+        hz: send rate — match HIL Tool update rate (default 10 Hz)."""
+        interval = 1.0 / max(hz, 0.1)
+        print(f"[HilConnector] idle — tracking ego at {hz} Hz. Press Ctrl+C to exit.")
+        try:
+            while True:
+                with self._lock:
+                    self._pos_m += self._speed_mps * interval
+                self._send_ego_state()
+                time.sleep(interval)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.close()
 
     def close(self) -> None:
         if self._closed:
@@ -365,9 +401,9 @@ class HilConnector(LiveConnector):
         def spd(raw: int) -> float | None:
             return raw * 0.01 if raw > 0 else None
 
-        # Gap: int32 raw in 0.1 m units; 0 = no vehicle, negative = overlap/crash
+        # Gap: int32 raw in 0.1 m units; HIL Tool sends 0 or negative as "no vehicle" sentinel.
         def gap(raw: int) -> float | None:
-            return None if raw == 0 else raw * 0.1
+            return None if raw <= 0 else raw * 0.1
 
         time_s = (msg["hour"] * 3600 + msg["minute"] * 60
                   + msg["second"] + msg["ms"] / 1000.0)

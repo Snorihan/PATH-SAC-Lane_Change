@@ -38,7 +38,7 @@ class HighwayShadowBridge:
                 "target_lane_index": ("0", "1", 0),
             }
 
-        deadzone = 0.2
+        deadzone = 0.4
         from_n, to_n, lane_id = vehicle.lane_index
         try:
             lanes_on_segment = len(vehicle.road.network.graph[from_n][to_n])

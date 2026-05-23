@@ -2,6 +2,7 @@
 gymnasium
 highway-env
 numpy
+stable-baselines3[extra]
 
 # Command-line argument parsing
 tyro[all]

@@ -118,6 +118,8 @@ class LaneChangingEnv(HighwayEnv):
             "ttc_weight": 80.0,
             "gap_weight": 40.0,
             "closing_speed_weight": 15.0,
+            "braking_reward_weight": 10.0,
+            "blocked_merge_weight": -20.0,
 
             # Lane change task
             "lane_success": 80.0,
@@ -192,6 +194,7 @@ class LaneChangingEnv(HighwayEnv):
         self.last_jerk_value = 0.0
         self.prev_reward_time = float(getattr(self, "time", 0.0))
         self.started_lane_change = False
+        self.merge_blocked = False
 
         self.start_lane_index = self.vehicle.lane_index
         self.ultimate_target_lane_index = self.find_target_lane(self.start_lane_index)
@@ -210,9 +213,19 @@ class LaneChangingEnv(HighwayEnv):
         if vehicle is None:
             return
 
-        vehicle.target_lane_index = command["target_lane_index"]
-        vehicle.action = {"acceleration": command["accel_mps2"]}
-        vehicle.target_speed = float(np.clip(vehicle.speed + command["accel_mps2"] * command["dt"], 0.0, 40.0))
+        target = command["target_lane_index"]
+        intended_lc = not self._same_lane(target, vehicle.lane_index)
+        if intended_lc and not self._lane_change_safe(target):
+            target = vehicle.lane_index
+            self.merge_blocked = True
+        else:
+            self.merge_blocked = False
+
+        accel = self._cap_accel_for_front_gap(command["accel_mps2"])
+
+        vehicle.target_lane_index = target
+        vehicle.action = {"acceleration": accel}
+        vehicle.target_speed = float(np.clip(vehicle.speed + accel * command["dt"], 0.0, 40.0))
         self.last_action_command = command
 
     # -- reward -----------------------------------------------------------
@@ -276,6 +289,55 @@ class LaneChangingEnv(HighwayEnv):
                 name   = "time_penalty",
                 fn     = lambda: 1.0,
                 weight = w["time_penalty"],
+                sign   = -1.0,
+            ),
+            # Comfort: reward for maintaining safe following gap (0→1)
+            RewardTerm(
+                name   = "gap",
+                fn     = self._r_fn_gap,
+                weight = w["gap_weight"],
+                sign   = +1.0,
+            ),
+            # Safety: penalize closing speed toward front vehicle — teaches braking before merge
+            RewardTerm(
+                name   = "closing_speed",
+                fn     = self._r_fn_closing_speed,
+                weight = w["closing_speed_weight"],
+                sign   = -1.0,
+            ),
+            # Safety: reward choosing to brake when a front vehicle is within comfortable gap
+            RewardTerm(
+                name   = "braking_reward",
+                fn     = self._r_fn_braking_reward,
+                weight = w["braking_reward_weight"],
+                sign   = +1.0,
+            ),
+            # Timing: penalize attempting a merge that the TTC gate had to block
+            RewardTerm(
+                name   = "blocked_merge",
+                fn     = lambda: 1.0 if self.merge_blocked else 0.0,
+                weight = w["blocked_merge_weight"],
+                sign   = +1.0,
+            ),
+            # Comfort: penalize lateral speed as discomfort proxy
+            RewardTerm(
+                name   = "lat_accel",
+                fn     = self._r_fn_lat_accel,
+                weight = w["lat_accel_weight"],
+                sign   = -1.0,
+            ),
+            # Task: per-step penalty for not initiating a requested lane change
+            RewardTerm(
+                name   = "lane_keeping",
+                fn     = self._r_fn_lane_keeping_when_requested,
+                weight = w["lane_keeping_penalty_when_requested"],
+                sign   = -1.0,
+            ),
+            # Task: penalty for drifting in the wrong lateral direction
+            RewardTerm(
+                name   = "wrong_lane",
+                fn     = self._r_fn_wrong_lane,
+                weight = w["wrong_lane_penalty"],
                 sign   = -1.0,
             ),
         ]
@@ -349,7 +411,27 @@ class LaneChangingEnv(HighwayEnv):
             self.steps_in_target_lane += 1
         else:
             self.steps_in_target_lane = 0
-        return self.steps_in_target_lane >= self.config.get("duration_after_lane_change", 40)
+
+        threshold = int(self.config.get("duration_after_lane_change", 40))
+        if self.steps_in_target_lane < threshold:
+            return False
+
+        # Reached target lane. If continuous_targets is enabled (default for live backend),
+        # pick the next adjacent target instead of terminating so the car keeps driving.
+        continuous = self.config.get(
+            "continuous_targets",
+            self.config.get("backend") == "aimsun_live",
+        )
+        if continuous:
+            new_target = self.find_target_lane(self.vehicle.lane_index)
+            if not self._same_lane(new_target, self.vehicle.lane_index):
+                self.target_lane_index = new_target
+                self.ultimate_target_lane_index = new_target
+                self.got_lane_success = False
+                self.steps_in_target_lane = 0
+                self.started_lane_change = False
+                return False   # continue episode with new target
+        return True  # terminate (single-lane road or continuous_targets=False)
 
     # ── Reset ─────────────────────────────────────────────────────────────────
 
@@ -480,6 +562,54 @@ class LaneChangingEnv(HighwayEnv):
     def _same_lane(self, a, b) -> bool:
         return tuple(a) == tuple(b)
 
+    @staticmethod
+    def _ttc(gap: float, other_v, ego_speed: float, ego_closing: bool) -> float:
+        """Time-to-collision in seconds; inf if gap is clear or not closing."""
+        if other_v is None or gap >= float("inf"):
+            return float("inf")
+        closing = (ego_speed - float(other_v.speed)) if ego_closing else (float(other_v.speed) - ego_speed)
+        if closing <= 0.0:
+            return float("inf")
+        return gap / closing
+
+    def _cap_accel_for_front_gap(self, accel_mps2: float) -> float:
+        """Acceleration gate based on front TTC.
+        Above gate: pass through. Below gate: cap upward accel.
+        Below half-gate: override with active braking regardless of agent command.
+        """
+        sv = self._get_surrounding_vehicles()
+        ego_speed = float(self.vehicle.speed)
+        front_ttc = self._ttc(sv.front_gap, sv.front_v, ego_speed, ego_closing=True)
+        gate = float(self.config.get("fwd_ttc_gate", 2.0))
+        if front_ttc >= gate:
+            return accel_mps2
+        alpha = float(np.clip(front_ttc / gate, 0.0, 1.0))
+        capped = min(accel_mps2, accel_mps2 * alpha) if accel_mps2 > 0.0 else accel_mps2
+        # Below half-gate: force braking proportional to urgency
+        half_gate = gate * 0.5
+        if front_ttc < half_gate:
+            max_decel = float(self.config.get("max_decel", 3.0))
+            urgency = float(np.clip(1.0 - front_ttc / half_gate, 0.0, 1.0))
+            return min(capped, -max_decel * urgency)
+        return capped
+
+    def _lane_change_safe(self, target_lane_index) -> bool:
+        """Return True if TTC to target-lane lead and lag both exceed lc_ttc_gate."""
+        sv = self._get_surrounding_vehicles()
+        ego_speed = float(self.vehicle.speed)
+        _, _, cur_id = self.vehicle.lane_index
+        _, _, tgt_id = target_lane_index
+
+        if tgt_id < cur_id:
+            lead_ttc = self._ttc(sv.llead_gap, sv.llead_v, ego_speed, ego_closing=True)
+            lag_ttc  = self._ttc(sv.llag_gap,  sv.llag_v,  ego_speed, ego_closing=False)
+        else:
+            lead_ttc = self._ttc(sv.rlead_gap, sv.rlead_v, ego_speed, ego_closing=True)
+            lag_ttc  = self._ttc(sv.rlag_gap,  sv.rlag_v,  ego_speed, ego_closing=False)
+
+        gate = float(self.config.get("lc_ttc_gate", 2.0))
+        return min(lead_ttc, lag_ttc) >= gate
+
     def find_target_lane(self, start_lane_index):
         """Temporary: pick adjacent lane. A separate network will handle this later."""
         from_n, to_n, lane_id = start_lane_index
@@ -586,6 +716,60 @@ class LaneChangingEnv(HighwayEnv):
             return 1.0
 
         return 0.0
+
+    def _r_fn_gap(self) -> float:
+        sv = self._get_surrounding_vehicles()
+        if sv.front_v is None:
+            return 1.0
+        comfortable_gap = max(float(self.vehicle.speed) * 2.0, 10.0)
+        return float(np.clip(sv.front_gap / comfortable_gap, 0.0, 1.0))
+
+    def _r_fn_closing_speed(self) -> float:
+        sv = self._get_surrounding_vehicles()
+        if sv.front_v is None:
+            return 0.0
+        closing = float(self.vehicle.speed) - float(sv.front_v.speed)
+        speed_limit = float(self.config.get("speed_limit", 30.0))
+        return float(np.clip(closing / max(speed_limit, 1.0), 0.0, 1.0))
+
+    def _r_fn_braking_reward(self) -> float:
+        """Reward braking when front gap is tight. Agent decides whether to LC or brake."""
+        sv = self._get_surrounding_vehicles()
+        if sv.front_v is None:
+            return 0.0
+        comfortable_gap = max(float(self.vehicle.speed) * 2.0, 10.0)
+        if sv.front_gap >= comfortable_gap:
+            return 0.0
+        veh_action = getattr(self.vehicle, "action", {}) or {}
+        accel = float(veh_action.get("acceleration", 0.0))
+        if accel >= 0.0:
+            return 0.0
+        max_decel = float(self.config.get("max_decel", 3.0))
+        return float(np.clip(abs(accel) / max(max_decel, 1e-6), 0.0, 1.0))
+
+    def _r_fn_lat_accel(self) -> float:
+        lane = self.road.network.get_lane(self.vehicle.lane_index)
+        _, lat = lane.local_coordinates(self.vehicle.position)
+        freq = float(self.config.get("policy_frequency", 15))
+        lat_speed = abs(lat - self.prev_lat) * freq
+        self.prev_lat = lat
+        return min(lat_speed, 5.0)
+
+    def _r_fn_lane_keeping_when_requested(self) -> float:
+        if self._same_lane(self.vehicle.lane_index, self.target_lane_index):
+            return 0.0
+        return 0.0 if self.started_lane_change else 1.0
+
+    def _r_fn_wrong_lane(self) -> float:
+        _, _, curr_id = self.vehicle.lane_index
+        _, _, target_id = self.target_lane_index
+        if curr_id == target_id:
+            return 0.0
+        lane = self.road.network.get_lane(self.vehicle.lane_index)
+        _, lat = lane.local_coordinates(self.vehicle.position)
+        direction = float(np.sign(target_id - curr_id))
+        return 1.0 if lat * direction < -0.1 else 0.0
+
     # ── Legacy ────────────────────────────────────────────────────────────────
 
     def _sample_scenario(self):
