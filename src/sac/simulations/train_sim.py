@@ -67,10 +67,11 @@ PHASE_CONFIGS = {
         "lane_start_bonus":                   0.0,
         "lane_keeping_penalty_when_requested": 0.0,
         "wrong_lane_penalty":                 0.0,
+        "oscillation_penalty_weight":          0.0,  # no penalty in Phase 1 (no traffic)
     },
     # Phase 1.5: same reward as Phase 1, with IDM traffic. TTC gate prevents merge crashes.
     15: {
-        "collision_penalty":               -500.0,
+        "collision_penalty":              -2000.0,
         "lane_success":                     200.0,
         "lane_progress_weight":              20.0,
         "ttc_weight":                         40.0,
@@ -85,6 +86,7 @@ PHASE_CONFIGS = {
         "lane_start_bonus":                   0.0,
         "lane_keeping_penalty_when_requested": 0.0,
         "wrong_lane_penalty":                 0.0,
+        "oscillation_penalty_weight":         10.0,  # start teaching non-oscillation with traffic
     },
     2: {
         # Full reward suite — defaults from lanechange_env but with raised lane_success.
@@ -103,6 +105,7 @@ PHASE_CONFIGS = {
         "lane_start_bonus":                   0.0,   # removed: was rushing lane changes
         "lane_keeping_penalty_when_requested": 0.0,  # removed: was creating urgency regardless of context
         "wrong_lane_penalty":                  1.0,  # reduced from 5.0: soften drift penalty
+        "oscillation_penalty_weight":         20.0,  # penalize back-and-forth LC behavior
     },
 }
 
@@ -127,7 +130,7 @@ def make_env(phase: int = 1):
         "duration":           40,
         "policy_frequency":   15,
         "speed_limit":        SPEED_LIMIT,
-        "continuous_targets": True,
+        "continuous_targets": False,
         "vehicles_count":     {1: 0, 15: 10, 2: 10}[phase],  # Phase 1: clean; 1.5+2: IDM traffic
         "lc_ttc_gate":        4.0,   # raised from 2.5: gate must match new conservative target
         "fwd_ttc_gate":       3.74,  # sweep trial 18 best

@@ -1,2 +1,8 @@
 runs/
 .venv/
+checkpoints/
+src/sac/checkpoints/
+__pycache__/
+*.pyc
+*.pyo
+

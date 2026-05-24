@@ -31,9 +31,9 @@ def make_env(phase: int = 2, lanes: int = None, render: bool = True):
         "duration":           40,
         "policy_frequency":   15,
         "speed_limit":        SPEED_LIMIT,
-        "continuous_targets": True,
+        "continuous_targets": False,
         "vehicles_count":     {1: 0, 15: 10, 2: 10}[phase],
-        "lc_ttc_gate":        1.56,
+        "lc_ttc_gate":        4.0,
         "fwd_ttc_gate":       3.74,
         "rewards":            {k: v / CONSTANT_REW_SCALING for k, v in PHASE_CONFIGS[phase].items()},
     }

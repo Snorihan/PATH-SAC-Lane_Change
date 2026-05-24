@@ -135,6 +135,16 @@ class LaneChangingEnv(HighwayEnv):
             # Rules / efficiency
             "speed_limit_weight": 1.0,
             "time_penalty": 0.05,
+
+            # Oscillation
+            "oscillation_penalty_weight": 0.0,
+        })
+        config.update({
+            # Hysteresis thresholds for intent → lane-change decision
+            "lc_start_threshold":       0.6,   # |intent| must exceed this to start a LC
+            "lc_stop_threshold":        0.3,   # |intent| must drop below this to cancel
+            "lc_cooldown_steps":        20,    # steps blocked after a LC starts
+            "oscillation_window_steps": 40,    # window for detecting direction reversals
         })
         return config
 
@@ -196,6 +206,13 @@ class LaneChangingEnv(HighwayEnv):
         self.started_lane_change = False
         self.merge_blocked = False
 
+        # Hysteresis / cooldown state
+        self.lc_cooldown       = 0     # steps remaining in post-LC cooldown
+        self.lc_active         = False # True while a lane-change maneuver is in flight
+        self.last_lc_direction = 0     # direction of last initiated LC: -1=left, +1=right
+        self.last_lc_step      = -999  # elapsed_steps when last LC was initiated
+        self._last_raw_intent  = 0.0   # raw action[1] from last step (for osc penalty)
+
         self.start_lane_index = self.vehicle.lane_index
         self.ultimate_target_lane_index = self.find_target_lane(self.start_lane_index)
         self.target_lane_index = self.ultimate_target_lane_index
@@ -213,7 +230,40 @@ class LaneChangingEnv(HighwayEnv):
         if vehicle is None:
             return
 
-        target = command["target_lane_index"]
+        raw_intent = float(action[1])
+        self._last_raw_intent = raw_intent
+
+        start_thr      = float(self.config.get("lc_start_threshold", 0.6))
+        stop_thr       = float(self.config.get("lc_stop_threshold",  0.3))
+        cooldown_steps = int(self.config.get("lc_cooldown_steps",    20))
+
+        # If vehicle completed its lane change, clear the active flag
+        if self.lc_active and self._same_lane(vehicle.lane_index, vehicle.target_lane_index):
+            self.lc_active = False
+
+        # Decrement cooldown each step
+        if self.lc_cooldown > 0:
+            self.lc_cooldown -= 1
+
+        # Hysteresis gate: translate continuous intent into a persistent LC decision
+        if self.lc_active:
+            if abs(raw_intent) < stop_thr:
+                # Intent dropped below stop threshold — abort maneuver
+                self.lc_active = False
+                target = vehicle.lane_index
+            else:
+                target = command["target_lane_index"]
+        elif self.lc_cooldown == 0 and abs(raw_intent) > start_thr:
+            # Intent strong enough and cooldown expired — start new LC
+            self.lc_active         = True
+            self.lc_cooldown       = cooldown_steps
+            self.last_lc_direction = int(np.sign(raw_intent))
+            self.last_lc_step      = self.elapsed_steps
+            target = command["target_lane_index"]
+        else:
+            target = vehicle.lane_index
+
+        # TTC safety gate (always applied on top of hysteresis decision)
         intended_lc = not self._same_lane(target, vehicle.lane_index)
         if intended_lc and not self._lane_change_safe(target):
             target = vehicle.lane_index
@@ -338,6 +388,13 @@ class LaneChangingEnv(HighwayEnv):
                 name   = "wrong_lane",
                 fn     = self._r_fn_wrong_lane,
                 weight = w["wrong_lane_penalty"],
+                sign   = -1.0,
+            ),
+            # Stability: penalize rapid intent direction reversals
+            RewardTerm(
+                name   = "oscillation",
+                fn     = self._r_fn_oscillation_penalty,
+                weight = w.get("oscillation_penalty_weight", 0.0),
                 sign   = -1.0,
             ),
         ]
@@ -769,6 +826,21 @@ class LaneChangingEnv(HighwayEnv):
         _, lat = lane.local_coordinates(self.vehicle.position)
         direction = float(np.sign(target_id - curr_id))
         return 1.0 if lat * direction < -0.1 else 0.0
+
+    def _r_fn_oscillation_penalty(self) -> float:
+        """Fire when agent commands a LC direction opposite to its last LC within the window."""
+        if self.last_lc_direction == 0:
+            return 0.0
+        start_thr = float(self.config.get("lc_start_threshold", 0.6))
+        window    = int(self.config.get("oscillation_window_steps", 40))
+        raw_intent = float(self._last_raw_intent)
+        if abs(raw_intent) < start_thr:
+            return 0.0
+        current_dir   = int(np.sign(raw_intent))
+        steps_since_lc = self.elapsed_steps - self.last_lc_step
+        if current_dir != self.last_lc_direction and steps_since_lc < window:
+            return 1.0
+        return 0.0
 
     # ── Legacy ────────────────────────────────────────────────────────────────
 
