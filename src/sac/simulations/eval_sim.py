@@ -93,11 +93,12 @@ def main():
         print(f"── Episode {ep + 1}  start={base.vehicle.lane_index[2]}  "
               f"target={base.target_lane_index[2]} ──")
 
-        total_reward = 0.0
-        term_totals  = {}
-        lane_changed = False
-        crashed      = False
-        ep_len       = 0
+        total_reward   = 0.0
+        term_totals    = {}
+        lane_changed   = False
+        crashed        = False
+        ep_len         = 0
+        last_shield    = {}
 
         while True:
             action, _ = model.predict(obs, deterministic=deterministic)
@@ -107,6 +108,7 @@ def main():
 
             rt  = info.get("reward_terms", {})
             lcs = info.get("lane_change_state", {})
+            last_shield = info.get("shield", {})
             for k, v in rt.items():
                 term_totals[k] = term_totals.get(k, 0.0) + v
 
@@ -131,6 +133,14 @@ def main():
                         continue
                     bar = "█" * min(int(abs(v) * 0.3), 30)
                     print(f"    {k:42s} {v:+8.2f}  {bar}")
+                if last_shield:
+                    fwd = last_shield.get("fwd_interventions", 0)
+                    lci = last_shield.get("lc_interventions", 0)
+                    rate = last_shield.get("intervention_rate", 0.0)
+                    min_fwd = last_shield.get("min_fwd_ttc", float("inf"))
+                    min_lc  = last_shield.get("min_lc_ttc",  float("inf"))
+                    print(f"  shield: fwd={fwd}  lc={lci}  rate={rate:.2f}/step  "
+                          f"min_fwd_ttc={pretty(min_fwd)}  min_lc_ttc={pretty(min_lc)}")
                 print()
                 break
 

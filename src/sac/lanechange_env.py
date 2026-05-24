@@ -213,6 +213,12 @@ class LaneChangingEnv(HighwayEnv):
         self.last_lc_step      = -999  # elapsed_steps when last LC was initiated
         self._last_raw_intent  = 0.0   # raw action[1] from last step (for osc penalty)
 
+        # Safety shield telemetry (reset each episode)
+        self.shield_fwd_interventions  = 0    # times _cap_accel_for_front_gap overrode accel
+        self.shield_lc_interventions   = 0    # times _lane_change_safe blocked a LC attempt
+        self.shield_min_fwd_ttc        = float("inf")  # min TTC seen before a fwd override
+        self.shield_min_lc_ttc         = float("inf")  # min TTC seen before a LC override
+
         self.start_lane_index = self.vehicle.lane_index
         self.ultimate_target_lane_index = self.find_target_lane(self.start_lane_index)
         self.target_lane_index = self.ultimate_target_lane_index
@@ -268,6 +274,11 @@ class LaneChangingEnv(HighwayEnv):
         if intended_lc and not self._lane_change_safe(target):
             target = vehicle.lane_index
             self.merge_blocked = True
+            self.shield_lc_interventions += 1
+            self.shield_min_lc_ttc = min(
+                self.shield_min_lc_ttc,
+                self._min_target_lane_ttc(target),
+            )
         else:
             self.merge_blocked = False
 
@@ -429,6 +440,7 @@ class LaneChangingEnv(HighwayEnv):
                 "steps_in_target_lane": self.steps_in_target_lane,
                 "target_lane_index": self.target_lane_index,
             }
+            info["shield"] = self._shield_info()
             return obs, reward, terminated, truncated, info
 
         command = self.live_bridge.decode_action_command(action)
@@ -457,6 +469,7 @@ class LaneChangingEnv(HighwayEnv):
                 "steps_in_target_lane": self.steps_in_target_lane,
                 "target_lane_index": self.target_lane_index,
             },
+            "shield":   self._shield_info(),
             "snapshot": normalized,
         }
         if "cda" in normalized:
@@ -640,6 +653,9 @@ class LaneChangingEnv(HighwayEnv):
         gate = float(self.config.get("fwd_ttc_gate", 2.0))
         if front_ttc >= gate:
             return accel_mps2
+        # Shield is intervening — log it
+        self.shield_fwd_interventions += 1
+        self.shield_min_fwd_ttc = min(self.shield_min_fwd_ttc, front_ttc)
         alpha = float(np.clip(front_ttc / gate, 0.0, 1.0))
         capped = min(accel_mps2, accel_mps2 * alpha) if accel_mps2 > 0.0 else accel_mps2
         # Below half-gate: force braking proportional to urgency
@@ -650,22 +666,37 @@ class LaneChangingEnv(HighwayEnv):
             return min(capped, -max_decel * urgency)
         return capped
 
-    def _lane_change_safe(self, target_lane_index) -> bool:
-        """Return True if TTC to target-lane lead and lag both exceed lc_ttc_gate."""
+    def _min_target_lane_ttc(self, target_lane_index) -> float:
+        """Return the minimum TTC to lead/lag in target lane (used for shield telemetry)."""
         sv = self._get_surrounding_vehicles()
         ego_speed = float(self.vehicle.speed)
         _, _, cur_id = self.vehicle.lane_index
         _, _, tgt_id = target_lane_index
-
         if tgt_id < cur_id:
             lead_ttc = self._ttc(sv.llead_gap, sv.llead_v, ego_speed, ego_closing=True)
             lag_ttc  = self._ttc(sv.llag_gap,  sv.llag_v,  ego_speed, ego_closing=False)
         else:
             lead_ttc = self._ttc(sv.rlead_gap, sv.rlead_v, ego_speed, ego_closing=True)
             lag_ttc  = self._ttc(sv.rlag_gap,  sv.rlag_v,  ego_speed, ego_closing=False)
+        return min(lead_ttc, lag_ttc)
 
+    def _lane_change_safe(self, target_lane_index) -> bool:
+        """Return True if TTC to target-lane lead and lag both exceed lc_ttc_gate."""
         gate = float(self.config.get("lc_ttc_gate", 2.0))
-        return min(lead_ttc, lag_ttc) >= gate
+        return self._min_target_lane_ttc(target_lane_index) >= gate
+
+    def _shield_info(self) -> dict:
+        """Snapshot of safety-shield intervention telemetry for the current episode so far."""
+        total = self.shield_fwd_interventions + self.shield_lc_interventions
+        steps = max(self.elapsed_steps, 1)
+        return {
+            "fwd_interventions":   self.shield_fwd_interventions,
+            "lc_interventions":    self.shield_lc_interventions,
+            "total_interventions": total,
+            "intervention_rate":   total / steps,
+            "min_fwd_ttc":         self.shield_min_fwd_ttc,
+            "min_lc_ttc":          self.shield_min_lc_ttc,
+        }
 
     def find_target_lane(self, start_lane_index):
         """Temporary: pick adjacent lane. A separate network will handle this later."""
