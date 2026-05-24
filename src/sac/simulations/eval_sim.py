@@ -21,10 +21,14 @@ import gymnasium as gym
 import lanechange_env  # noqa: F401
 from wrappers import ObsWrapper
 from stable_baselines3 import SAC
-from train_sim import PHASE_CONFIGS, CONSTANT_REW_SCALING, SPEED_LIMIT, RandomLanesWrapper
+from train_sim import (
+    PHASE_CONFIGS, CONSTANT_REW_SCALING, SPEED_LIMIT, RandomLanesWrapper,
+    _PHASE_VEHICLES,
+)
 
 
-def make_env(phase: int = 2, lanes: int = None, render: bool = True):
+def make_env(phase: int = 3, lanes: int = None, render: bool = True):
+    lc_gate = float("inf") if phase == 0 else 4.0
     config = {
         "lane_width":         4.0,
         "road_length":        1000.0,
@@ -32,8 +36,8 @@ def make_env(phase: int = 2, lanes: int = None, render: bool = True):
         "policy_frequency":   15,
         "speed_limit":        SPEED_LIMIT,
         "continuous_targets": False,
-        "vehicles_count":     {1: 0, 15: 10, 2: 10}[phase],
-        "lc_ttc_gate":        4.0,
+        "vehicles_count":     _PHASE_VEHICLES[phase],
+        "lc_ttc_gate":        lc_gate,
         "fwd_ttc_gate":       3.74,
         "rewards":            {k: v / CONSTANT_REW_SCALING for k, v in PHASE_CONFIGS[phase].items()},
     }
@@ -62,7 +66,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model",      type=str, default="checkpoints/p2b/sim_baseline",
                         help="Path to checkpoint zip (omit .zip)")
-    parser.add_argument("--phase",      type=int, default=2, choices=[1, 15, 2])
+    parser.add_argument("--phase",      type=int, default=3, choices=[0, 1, 15, 2, 3])
     parser.add_argument("--episodes",   type=int, default=5)
     parser.add_argument("--lanes",      type=int, default=None,
                         help="Fix lane count (default: random 2-4 as in training)")

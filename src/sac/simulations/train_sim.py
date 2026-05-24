@@ -43,18 +43,43 @@ class TqdmCallback(BaseCallback):
         self._bar.close()
 
 LANE_CHOICES = (2, 3, 4)
-SPEED_LIMIT  = 30.0  # m/s. That is ABOUT 70 mph
+SPEED_LIMIT  = 30.0  # m/s (~70 mph)
 CONSTANT_REW_SCALING = 10.0
 
-# Reward weights per training phase.
-# Phase 1: teach the agent the lane-change task only — big sparse reward + dense progress.
-# Phase 2: add comfort and efficiency terms to refine the learned policy.
+# Reward weights per training phase. All divided by CONSTANT_REW_SCALING in make_env().
+#
+# Phase 0  — braking only, no traffic, lane changes blocked via lc_ttc_gate=inf.
+#             Teaches longitudinal safety before any lateral behavior.
+# Phase 1  — empty road lane change. No traffic. Teaches clean merge + hold.
+# Phase 15 — single slow lead vehicle in ego lane, adjacent lane open. Combines
+#             braking and lane changing around one obstacle (replaces old 15).
+# Phase 2  — 10 IDM vehicles, phase-1 rewards. Gap selection + wait-for-gap.
+# Phase 3  — full reward suite, 10 vehicles. Comfort + efficiency refinement.
 PHASE_CONFIGS = {
+    0: {
+        # Longitudinal safety only. LC blocked via lc_ttc_gate=inf in make_env().
+        "collision_penalty":               -500.0,
+        "ttc_weight":                        40.0,
+        "closing_speed_weight":              15.0,
+        "braking_reward_weight":             20.0,
+        "gap_weight":                        10.0,
+        "jerk_weight":                        2.0,
+        # zero everything lateral
+        "lane_success":                       0.0,
+        "lane_progress_weight":               0.0,
+        "lane_start_bonus":                   0.0,
+        "lane_keeping_penalty_when_requested": 0.0,
+        "wrong_lane_penalty":                 0.0,
+        "blocked_merge_weight":               0.0,
+        "lat_accel_weight":                   0.0,
+        "speed_limit_weight":                 1.0,
+        "time_penalty":                       0.0,
+        "oscillation_penalty_weight":         0.0,
+    },
     1: {
         "collision_penalty":               -500.0,
         "lane_success":                     200.0,
         "lane_progress_weight":              20.0,
-        # zero out everything else
         "ttc_weight":                         40.0,
         "gap_weight":                         0.0,
         "closing_speed_weight":               0.0,
@@ -67,18 +92,19 @@ PHASE_CONFIGS = {
         "lane_start_bonus":                   0.0,
         "lane_keeping_penalty_when_requested": 0.0,
         "wrong_lane_penalty":                 0.0,
-        "oscillation_penalty_weight":          0.0,  # no penalty in Phase 1 (no traffic)
+        "oscillation_penalty_weight":          0.0,
     },
-    # Phase 1.5: same reward as Phase 1, with IDM traffic. TTC gate prevents merge crashes.
+    # Phase 1.5: 1 slow lead vehicle in ego lane, adjacent lane open.
+    # Agent must learn to brake or change lanes to pass.
     15: {
         "collision_penalty":              -2000.0,
         "lane_success":                     200.0,
         "lane_progress_weight":              20.0,
         "ttc_weight":                         40.0,
-        "gap_weight":                         0.0,
-        "closing_speed_weight":               0.0,
-        "braking_reward_weight":              0.0,
-        "blocked_merge_weight":               0.0,
+        "closing_speed_weight":              10.0,
+        "braking_reward_weight":             15.0,
+        "gap_weight":                         5.0,
+        "blocked_merge_weight":             -10.0,  # mild: penalize blocked merges to build awareness
         "jerk_weight":                        0.0,
         "lat_accel_weight":                   0.0,
         "speed_limit_weight":                 0.0,
@@ -86,26 +112,45 @@ PHASE_CONFIGS = {
         "lane_start_bonus":                   0.0,
         "lane_keeping_penalty_when_requested": 0.0,
         "wrong_lane_penalty":                 0.0,
-        "oscillation_penalty_weight":         10.0,  # start teaching non-oscillation with traffic
+        "oscillation_penalty_weight":         10.0,
     },
+    # Phase 2: 10 IDM vehicles, phase-1 rewards. Gap selection, wait-for-gap.
     2: {
-        # Full reward suite — defaults from lanechange_env but with raised lane_success.
-        "collision_penalty":              -2000.0,  # raised 4x: crash must cost more than lane_success
+        "collision_penalty":              -2000.0,
+        "lane_success":                     200.0,
+        "lane_progress_weight":              20.0,
+        "ttc_weight":                         40.0,
+        "closing_speed_weight":              10.0,
+        "braking_reward_weight":             15.0,
+        "gap_weight":                         5.0,
+        "blocked_merge_weight":             -10.0,
+        "jerk_weight":                        0.0,
+        "lat_accel_weight":                   0.0,
+        "speed_limit_weight":                 0.0,
+        "time_penalty":                       0.0,
+        "lane_start_bonus":                   0.0,
+        "lane_keeping_penalty_when_requested": 0.0,
+        "wrong_lane_penalty":                 0.0,
+        "oscillation_penalty_weight":         10.0,
+    },
+    # Phase 3: full reward suite. Comfort + efficiency on top of safety.
+    3: {
+        "collision_penalty":              -2000.0,
         "lane_success":                     500.0,
         "lane_progress_weight":              20.0,
         "ttc_weight":                        80.0,
-        "gap_weight":                         0.0,  # removed: same-lane gap was rewarding pre-crash positions
-        "closing_speed_weight":              15.0,  # penalize closing on front vehicle
-        "braking_reward_weight":             20.0,  # positive reward for braking when front gap is tight
-        "blocked_merge_weight":               0.0,  # disabled: created never-merge attractor
+        "gap_weight":                         0.0,
+        "closing_speed_weight":              15.0,
+        "braking_reward_weight":             20.0,
+        "blocked_merge_weight":             -10.0,  # penalize unsafe merge attempts
         "jerk_weight":                        2.0,
         "lat_accel_weight":                   1.0,
         "speed_limit_weight":                 1.0,
         "time_penalty":                       0.05,
-        "lane_start_bonus":                   0.0,   # removed: was rushing lane changes
-        "lane_keeping_penalty_when_requested": 0.0,  # removed: was creating urgency regardless of context
-        "wrong_lane_penalty":                  1.0,  # reduced from 5.0: soften drift penalty
-        "oscillation_penalty_weight":         20.0,  # penalize back-and-forth LC behavior
+        "lane_start_bonus":                   0.0,
+        "lane_keeping_penalty_when_requested": 0.0,
+        "wrong_lane_penalty":                  1.0,
+        "oscillation_penalty_weight":         20.0,
     },
 }
 
@@ -123,7 +168,12 @@ class RandomLanesWrapper(gym.Wrapper):
         return self.env.reset(**kwargs)
 
 
+_PHASE_VEHICLES = {0: 0, 1: 0, 15: 1, 2: 10, 3: 10}
+
 def make_env(phase: int = 1):
+    # Phase 0: block LC entirely via an infinite TTC gate so the agent can only learn braking.
+    lc_gate = float("inf") if phase == 0 else 4.0
+
     env = gym.make("lane-changing-v0", config={
         "lane_width":         4.0,
         "road_length":        1000.0,
@@ -131,9 +181,9 @@ def make_env(phase: int = 1):
         "policy_frequency":   15,
         "speed_limit":        SPEED_LIMIT,
         "continuous_targets": False,
-        "vehicles_count":     {1: 0, 15: 10, 2: 10}[phase],  # Phase 1: clean; 1.5+2: IDM traffic
-        "lc_ttc_gate":        4.0,   # raised from 2.5: gate must match new conservative target
-        "fwd_ttc_gate":       3.74,  # sweep trial 18 best
+        "vehicles_count":     _PHASE_VEHICLES[phase],
+        "lc_ttc_gate":        lc_gate,
+        "fwd_ttc_gate":       3.74,
         "rewards":            {k: v / CONSTANT_REW_SCALING for k, v in PHASE_CONFIGS[phase].items()},
     })
     env = RandomLanesWrapper(env)
@@ -146,8 +196,9 @@ def main():
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     parser.add_argument("--resume",         type=str, default=None,
                         help="Path to existing checkpoint zip to continue training")
-    parser.add_argument("--phase",          type=int, default=1, choices=[1, 15, 2],
-                        help="1=no traffic, 15=traffic+phase1 rewards, 2=full reward suite")
+    parser.add_argument("--phase",          type=int, default=1, choices=[0, 1, 15, 2, 3],
+                        help="0=braking only (LC blocked), 1=empty road LC, "
+                             "15=single obstacle passing, 2=10 IDM vehicles, 3=full reward suite")
     parser.add_argument("--n-envs",         type=int, default=1,
                         help="Number of parallel envs (uses SubprocVecEnv). Try 2-4.")
     parser.add_argument("--target-entropy", type=float, default=None,
@@ -164,7 +215,13 @@ def main():
                              "Use 0.5-1.0 when critic_loss is blowing up (>5000).")
     args = parser.parse_args()
 
-    phase_label = {1: "no traffic", 15: "traffic + phase-1 rewards", 2: "full reward suite"}
+    phase_label = {
+        0:  "braking only (LC blocked)",
+        1:  "empty road lane change",
+        15: "single obstacle passing",
+        2:  "10 IDM vehicles",
+        3:  "full reward suite",
+    }
     print(f"[train_sim] Phase {args.phase}: {phase_label[args.phase]}  n_envs={args.n_envs}")
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
