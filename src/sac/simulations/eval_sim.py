@@ -31,23 +31,52 @@ def make_env(phase: int = 3, lanes: int = None, render: bool = True):
     lc_gate = float("inf") if phase == 0 else 4.0
     config = {
         "lane_width":         4.0,
-        "road_length":        1000.0,
+        "road_length":        2000.0,
         "duration":           40,
         "policy_frequency":   15,
         "speed_limit":        SPEED_LIMIT,
         "continuous_targets": False,
         "vehicles_count":     _PHASE_VEHICLES[phase],
+        "initial_spacing":    5,
         "lc_ttc_gate":        lc_gate,
         "fwd_ttc_gate":       3.74,
         "rewards":            {k: v / CONSTANT_REW_SCALING for k, v in PHASE_CONFIGS[phase].items()},
     }
+
+    # Mirror train_sim.py phase-specific config exactly
+    if phase == 0:
+        config["lanes_count"]             = 2
+        config["other_vehicles_type"]     = "highway_env.vehicle.behavior.LinearVehicle"
+        config["initial_spacing"]         = 2
+    if phase == 1:
+        config["lanes_count"]             = 2
+        config["p1a_obstacle"]            = True
+        config["vehicles_count"]          = 0
+        config["continuous_targets"]      = True
+        config["require_obstacle_for_lc"] = True
+    if phase == 11:
+        config["lanes_count"]             = 2
+        config["p1_obstacles"]            = True
+        config["vehicles_count"]          = 0
+        config["continuous_targets"]      = True
+        config["require_obstacle_for_lc"] = True
+    if phase == 15:
+        config["lanes_count"]             = 2
+        config["p15_obstacle"]            = True
+        config["vehicles_count"]          = 0
+        config["continuous_targets"]      = True
+        config["require_obstacle_for_lc"] = True
+
+    # --lanes flag overrides the phase default
     if lanes is not None:
         config["lanes_count"] = lanes
 
     env = gym.make("lane-changing-v0",
                    render_mode="human" if render else None,
                    config=config)
-    if lanes is None:
+    # RandomLanesWrapper only for phases that trained with it (2, 3),
+    # and only when no explicit --lanes override was given
+    if lanes is None and phase not in (0, 1, 11, 15):
         env = RandomLanesWrapper(env)
     return ObsWrapper(env)
 
@@ -66,7 +95,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model",      type=str, default="checkpoints/p2b/sim_baseline",
                         help="Path to checkpoint zip (omit .zip)")
-    parser.add_argument("--phase",      type=int, default=3, choices=[0, 1, 15, 2, 3])
+    parser.add_argument("--phase",      type=int, default=3, choices=[0, 1, 11, 15, 2, 3])
     parser.add_argument("--episodes",   type=int, default=5)
     parser.add_argument("--lanes",      type=int, default=None,
                         help="Fix lane count (default: random 2-4 as in training)")

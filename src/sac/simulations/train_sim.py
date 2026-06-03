@@ -59,10 +59,13 @@ PHASE_CONFIGS = {
     0: {
         # Longitudinal safety only. LC blocked via lc_ttc_gate=inf in make_env().
         "collision_penalty":               -500.0,
-        "ttc_weight":                        40.0,
-        "closing_speed_weight":              15.0,
+        "ttc_weight":                        15.0,
+        "closing_speed_weight":             5.0,
         "braking_reward_weight":             20.0,
-        "gap_weight":                        10.0,
+        # gap_weight=0: when stopped, comfortable_gap collapses to 10m (ego_speed=0),
+        # and LinearVehicles drive away → front_gap/10 = 1.0 every step for free.
+        # Zeroing gap prevents that hack; braking_reward teaches gap management instead.
+        "gap_weight":                         0.0,
         "jerk_weight":                        2.0,
         # zero everything lateral
         "lane_success":                       0.0,
@@ -72,10 +75,16 @@ PHASE_CONFIGS = {
         "wrong_lane_penalty":                 0.0,
         "blocked_merge_weight":               0.0,
         "lat_accel_weight":                   0.0,
-        "speed_limit_weight":                 1.0,
-        "time_penalty":                       0.0,
+        # speed_limit_weight=6: 0.6/step at full speed — enough to make stopping
+        # unprofitable without drowning TTC/closing_speed safety signals.
+        "speed_limit_weight":                 6.0,
+        # time_penalty capped at ~0.8 raw before crashing becomes preferable to stopping.
+        # 0.5 → 0.05/step → -30 total: mild discouragement, safe.
+        "time_penalty":                       0.5,
         "oscillation_penalty_weight":         0.0,
     },
+    # Phase 1A: single stopped obstacle in ego lane, adjacent lane open.
+    # Teaches clean LC mechanics in the simplest possible setting.
     1: {
         "collision_penalty":               -500.0,
         "lane_success":                     200.0,
@@ -92,19 +101,19 @@ PHASE_CONFIGS = {
         "lane_start_bonus":                   0.0,
         "lane_keeping_penalty_when_requested": 0.0,
         "wrong_lane_penalty":                 0.0,
-        "oscillation_penalty_weight":          0.0,
+        "oscillation_penalty_weight":          5.0,  # small: dampen swerving without blocking exploration
     },
-    # Phase 1.5: 1 slow lead vehicle in ego lane, adjacent lane open.
-    # Agent must learn to brake or change lanes to pass.
-    15: {
-        "collision_penalty":              -2000.0,
+    # Phase 1B: two staggered stopped obstacles, one per lane.
+    # Teaches repeated justified lane changes and commitment.
+    11: {
+        "collision_penalty":               -500.0,
         "lane_success":                     200.0,
         "lane_progress_weight":              20.0,
         "ttc_weight":                         40.0,
-        "closing_speed_weight":              10.0,
-        "braking_reward_weight":             15.0,
-        "gap_weight":                         5.0,
-        "blocked_merge_weight":             -10.0,  # mild: penalize blocked merges to build awareness
+        "gap_weight":                         0.0,
+        "closing_speed_weight":               0.0,
+        "braking_reward_weight":              0.0,
+        "blocked_merge_weight":               0.0,
         "jerk_weight":                        0.0,
         "lat_accel_weight":                   0.0,
         "speed_limit_weight":                 0.0,
@@ -112,7 +121,27 @@ PHASE_CONFIGS = {
         "lane_start_bonus":                   0.0,
         "lane_keeping_penalty_when_requested": 0.0,
         "wrong_lane_penalty":                 0.0,
-        "oscillation_penalty_weight":         10.0,
+        "oscillation_penalty_weight":         10.0,  # moderate: more opportunity to oscillate here
+    },
+    # Phase 1.5: 75% follow (both lanes blocked) / 25% escape (ego lane only).
+    # Teaches when to lane change vs when to follow. lc_progress=0 intentionally.
+    15: {
+        "collision_penalty":              -2000.0,
+        "lane_success":                     200.0,
+        "lane_progress_weight":               0.0,  # LC is not always correct here
+        "ttc_weight":                         40.0,
+        "closing_speed_weight":              10.0,
+        "braking_reward_weight":             15.0,
+        "gap_weight":                         5.0,
+        "blocked_merge_weight":             -10.0,
+        "jerk_weight":                        0.0,
+        "lat_accel_weight":                   0.0,
+        "speed_limit_weight":                 0.0,
+        "time_penalty":                       0.0,
+        "lane_start_bonus":                   0.0,
+        "lane_keeping_penalty_when_requested": 0.0,
+        "wrong_lane_penalty":                 0.0,
+        "oscillation_penalty_weight":         20.0,  # strong: unnecessary swerving must be costly
     },
     # Phase 2: 10 IDM vehicles, phase-1 rewards. Gap selection, wait-for-gap.
     2: {
@@ -168,25 +197,59 @@ class RandomLanesWrapper(gym.Wrapper):
         return self.env.reset(**kwargs)
 
 
-_PHASE_VEHICLES = {0: 0, 1: 0, 15: 1, 2: 10, 3: 10}
+_PHASE_VEHICLES = {0: 10, 1: 0, 11: 0, 15: 0, 2: 10, 3: 10}
 
 def make_env(phase: int = 1):
     # Phase 0: block LC entirely via an infinite TTC gate so the agent can only learn braking.
     lc_gate = float("inf") if phase == 0 else 4.0
 
-    env = gym.make("lane-changing-v0", config={
+    config = {
         "lane_width":         4.0,
-        "road_length":        1000.0,
+        "road_length":        2000.0,
         "duration":           40,
         "policy_frequency":   15,
         "speed_limit":        SPEED_LIMIT,
         "continuous_targets": False,
         "vehicles_count":     _PHASE_VEHICLES[phase],
+        "initial_spacing":    5,
         "lc_ttc_gate":        lc_gate,
         "fwd_ttc_gate":       3.74,
         "rewards":            {k: v / CONSTANT_REW_SCALING for k, v in PHASE_CONFIGS[phase].items()},
-    })
-    env = RandomLanesWrapper(env)
+    }
+
+    # Phase 0: fix 2 lanes so 4 vehicles create genuine congestion (~2 per lane).
+    # Use LinearVehicle (no lane changes, constant speed) so the ego is never side-swiped
+    # by an IDM lane change — Phase 0 should be pure longitudinal car-following.
+    # All other phases randomize lanes via RandomLanesWrapper and use default IDM.
+    if phase == 0:
+        config["lanes_count"] = 2
+        config["other_vehicles_type"] = "highway_env.vehicle.behavior.LinearVehicle"
+        config["initial_spacing"] = 2
+
+    if phase == 1:
+        config["lanes_count"]             = 2
+        config["p1a_obstacle"]            = True
+        config["vehicles_count"]          = 0
+        config["continuous_targets"]      = True   # full 600-step episodes; osc penalty prevents ping-pong
+        config["require_obstacle_for_lc"] = True   # obstacle at 50-100m always within 80m at LC completion
+
+    if phase == 11:
+        config["lanes_count"]             = 2
+        config["p1_obstacles"]            = True
+        config["vehicles_count"]          = 0
+        config["continuous_targets"]      = True
+        config["require_obstacle_for_lc"] = True
+
+    if phase == 15:
+        config["lanes_count"]             = 2
+        config["p15_obstacle"]            = True
+        config["vehicles_count"]          = 0
+        config["continuous_targets"]      = True
+        config["require_obstacle_for_lc"] = True
+
+    env = gym.make("lane-changing-v0", config=config)
+    if phase not in (0, 1, 11, 15):
+        env = RandomLanesWrapper(env)
     return ObsWrapper(env)
 
 
@@ -196,9 +259,10 @@ def main():
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints")
     parser.add_argument("--resume",         type=str, default=None,
                         help="Path to existing checkpoint zip to continue training")
-    parser.add_argument("--phase",          type=int, default=1, choices=[0, 1, 15, 2, 3],
-                        help="0=braking only (LC blocked), 1=empty road LC, "
-                             "15=single obstacle passing, 2=10 IDM vehicles, 3=full reward suite")
+    parser.add_argument("--phase",          type=int, default=1, choices=[0, 1, 11, 15, 2, 3],
+                        help="0=braking only, 1=1A single stopped obstacle, "
+                             "11=1B two staggered obstacles, 15=1.5 follow-vs-LC, "
+                             "2=10 IDM vehicles, 3=full reward suite")
     parser.add_argument("--n-envs",         type=int, default=1,
                         help="Number of parallel envs (uses SubprocVecEnv). Try 2-4.")
     parser.add_argument("--target-entropy", type=float, default=None,
@@ -217,8 +281,9 @@ def main():
 
     phase_label = {
         0:  "braking only (LC blocked)",
-        1:  "empty road lane change",
-        15: "single obstacle passing",
+        1:  "1A single stopped obstacle",
+        11: "1B two staggered obstacles",
+        15: "1.5 follow vs LC judgment",
         2:  "10 IDM vehicles",
         3:  "full reward suite",
     }

@@ -6,6 +6,7 @@ from highway_env import utils
 from highway_env.envs.common.abstract import AbstractEnv
 from highway_env.envs.highway_env import HighwayEnv
 from highway_env.vehicle.controller import ControlledVehicle
+from highway_env.vehicle.behavior import LinearVehicle
 from highway_env.road.road import Road, RoadNetwork
 from highway_env.road.lane import StraightLane, LineType
 from highway_env.vehicle.kinematics import Vehicle
@@ -200,6 +201,7 @@ class LaneChangingEnv(HighwayEnv):
         self.prev_acceleration = 0.0
         self.prev_lat = 0.0
         self.steps_in_target_lane = 0
+        self.steps_after_success = 0
         self.elapsed_steps = 0
         self.last_jerk_value = 0.0
         self.prev_reward_time = float(getattr(self, "time", 0.0))
@@ -212,6 +214,7 @@ class LaneChangingEnv(HighwayEnv):
         self.last_lc_direction = 0     # direction of last initiated LC: -1=left, +1=right
         self.last_lc_step      = -999  # elapsed_steps when last LC was initiated
         self._last_raw_intent  = 0.0   # raw action[1] from last step (for osc penalty)
+        self._lc_source_lane   = None  # lane ego was in when the current LC was initiated
 
         # Safety shield telemetry (reset each episode)
         self.shield_fwd_interventions  = 0    # times _cap_accel_for_front_gap overrode accel
@@ -265,6 +268,7 @@ class LaneChangingEnv(HighwayEnv):
             self.lc_cooldown       = cooldown_steps
             self.last_lc_direction = int(np.sign(raw_intent))
             self.last_lc_step      = self.elapsed_steps
+            self._lc_source_lane   = self.vehicle.lane_index
             target = command["target_lane_index"]
         else:
             target = vehicle.lane_index
@@ -285,8 +289,13 @@ class LaneChangingEnv(HighwayEnv):
         accel = self._cap_accel_for_front_gap(command["accel_mps2"])
 
         vehicle.target_lane_index = target
-        vehicle.action = {"acceleration": accel}
-        vehicle.target_speed = float(np.clip(vehicle.speed + accel * command["dt"], 0.0, 40.0))
+        # ControlledVehicle.act() always recomputes vehicle.action via its P-controller:
+        #   speed_control = KP_A * (target_speed - speed)
+        # Setting target_speed = speed + accel/KP_A makes speed_control produce exactly accel.
+        # The naive formula (speed + accel*dt) only delivers ~11% of intended acceleration.
+        vehicle.target_speed = float(np.clip(
+            vehicle.speed + accel / ControlledVehicle.KP_A, 0.0, 40.0
+        ))
         self.last_action_command = command
 
     # -- reward -----------------------------------------------------------
@@ -482,8 +491,13 @@ class LaneChangingEnv(HighwayEnv):
         else:
             self.steps_in_target_lane = 0
 
-        threshold = int(self.config.get("duration_after_lane_change", 40))
-        if self.steps_in_target_lane < threshold:
+        # Only count post-success steps from when got_lane_success fired, not from
+        # when lane_index first snaps (which happens mid-maneuver in highway-env).
+        if self.got_lane_success:
+            self.steps_after_success += 1
+
+        threshold = int(self.config.get("duration_after_lane_change", 50))
+        if self.steps_after_success < threshold:
             return False
 
         # Reached target lane. If continuous_targets is enabled (default for live backend),
@@ -499,6 +513,7 @@ class LaneChangingEnv(HighwayEnv):
                 self.ultimate_target_lane_index = new_target
                 self.got_lane_success = False
                 self.steps_in_target_lane = 0
+                self.steps_after_success = 0
                 self.started_lane_change = False
                 return False   # continue episode with new target
         return True  # terminate (single-lane road or continuous_targets=False)
@@ -527,6 +542,16 @@ class LaneChangingEnv(HighwayEnv):
             scenario = source.sample_initial_state(self.np_random)
 
         self._apply_initial_state(scenario, info)
+
+        if self.config.get("p1a_obstacle", False):
+            self._place_p1a_obstacle()
+
+        if self.config.get("p1_obstacles", False):
+            self._place_p1_obstacles()
+
+        if self.config.get("p15_obstacle", False):
+            self._place_p15_obstacle()
+
         self._reset_episode_state()
         obs = self._observe_env()
 
@@ -564,6 +589,87 @@ class LaneChangingEnv(HighwayEnv):
             "pos_m":    pos_m,
             "speed":    speed,
         }
+
+    def _place_p1a_obstacle(self) -> None:
+        """Phase 1A: one stopped obstacle in ego's lane, adjacent lane empty.
+        Teaches the clean mechanics of a single justified lane change."""
+        self.road.vehicles = [v for v in self.road.vehicles if v is self.vehicle]
+
+        road_length = float(self.config.get("road_length", 1000.0))
+        ego_lane = self.road.network.get_lane(self.vehicle.lane_index)
+        ego_lon, _ = ego_lane.local_coordinates(self.vehicle.position)
+
+        dist = float(self.np_random.uniform(50.0, 100.0))
+        lon1 = min(ego_lon + dist, road_length - 20.0)
+        obs = LinearVehicle(self.road, ego_lane.position(lon1, 0.0),
+                            heading=ego_lane.heading_at(lon1), speed=0.0)
+        self.road.vehicles.append(obs)
+
+    def _place_p1_obstacles(self) -> None:
+        """Phase 1B: two stopped LinearVehicle obstacles, one per lane, staggered.
+        Obstacle 1 in ego's lane (closer), obstacle 2 in adjacent lane (farther).
+        Forces two sequential justified lane changes per episode."""
+        self.road.vehicles = [v for v in self.road.vehicles if v is self.vehicle]
+
+        road_length = float(self.config.get("road_length", 1000.0))
+        from_n, to_n, ego_lid = self.vehicle.lane_index
+        adj_lid = (ego_lid + 1) if ego_lid == 0 else (ego_lid - 1)
+
+        ego_lane = self.road.network.get_lane(self.vehicle.lane_index)
+        adj_lane = self.road.network.get_lane((from_n, to_n, adj_lid))
+        ego_lon, _ = ego_lane.local_coordinates(self.vehicle.position)
+
+        d1 = float(self.np_random.uniform(50.0, 350.0))
+        d2 = d1 + float(self.np_random.uniform(100.0, 250.0))
+
+        lon1 = min(ego_lon + d1, road_length - 20.0)
+        obs1 = LinearVehicle(self.road, ego_lane.position(lon1, 0.0),
+                             heading=ego_lane.heading_at(lon1), speed=0.0)
+        self.road.vehicles.append(obs1)
+
+        lon2 = min(ego_lon + d2, road_length - 20.0)
+        obs2 = LinearVehicle(self.road, adj_lane.position(lon2, 0.0),
+                             heading=adj_lane.heading_at(lon2), speed=0.0)
+        self.road.vehicles.append(obs2)
+
+    def _place_p15_obstacle(self) -> None:
+        """Phase 1.5: 75% follow scenario (both lanes blocked at similar distance/speed),
+        25% escape scenario (ego lane stopped, adjacent open).
+        Teaches follow-vs-LC judgment. lc_progress=0 in this phase."""
+        self.road.vehicles = [v for v in self.road.vehicles if v is self.vehicle]
+
+        road_length = float(self.config.get("road_length", 1000.0))
+        from_n, to_n, ego_lid = self.vehicle.lane_index
+        adj_lid = (ego_lid + 1) if ego_lid == 0 else (ego_lid - 1)
+        ego_lane = self.road.network.get_lane(self.vehicle.lane_index)
+        adj_lane = self.road.network.get_lane((from_n, to_n, adj_lid))
+        ego_lon, _ = ego_lane.local_coordinates(self.vehicle.position)
+
+        if self.np_random.random() < 0.75:
+            # Follow scenario: both lanes have a lead vehicle at similar distance and speed.
+            # LC is not the correct response — agent should match speed and maintain headway.
+            dist  = float(self.np_random.uniform(80.0, 200.0))
+            speed = float(self.np_random.uniform(5.0, 12.0))
+            adj_dist  = max(30.0, dist  + float(self.np_random.uniform(-20.0, 20.0)))
+            adj_speed = max(0.0,  speed + float(self.np_random.uniform(-2.0,   2.0)))
+
+            lon1 = min(ego_lon + dist, road_length - 20.0)
+            self.road.vehicles.append(LinearVehicle(
+                self.road, ego_lane.position(lon1, 0.0),
+                heading=ego_lane.heading_at(lon1), speed=speed))
+
+            lon2 = min(ego_lon + adj_dist, road_length - 20.0)
+            self.road.vehicles.append(LinearVehicle(
+                self.road, adj_lane.position(lon2, 0.0),
+                heading=adj_lane.heading_at(lon2), speed=adj_speed))
+        else:
+            # Escape scenario: ego lane blocked by stopped obstacle, adjacent lane clear.
+            # LC is the correct response once the agent is close enough.
+            dist = float(self.np_random.uniform(50.0, 120.0))
+            lon1 = min(ego_lon + dist, road_length - 20.0)
+            self.road.vehicles.append(LinearVehicle(
+                self.road, ego_lane.position(lon1, 0.0),
+                heading=ego_lane.heading_at(lon1), speed=0.0))
 
     # ── Surrounding vehicle queries ───────────────────────────────────────────
 
@@ -756,11 +862,32 @@ class LaneChangingEnv(HighwayEnv):
         return -(ego_speed - speed_limit)
 
     def _r_fn_lane_change_success(self, curr_lane_index):
-        if self._same_lane(curr_lane_index, self.target_lane_index) and not self.got_lane_success:
-            self.got_lane_success = True
-            return 1
-        else:
+        if not (self._same_lane(curr_lane_index, self.target_lane_index) and not self.got_lane_success):
             return 0
+        self.got_lane_success = True
+        if self.config.get("require_obstacle_for_lc", False):
+            if not self._obstacle_near_ego_in_lane(self._lc_source_lane):
+                return 0  # frivolous LC: obstacle not found in old lane
+        return 1
+
+    def _obstacle_near_ego_in_lane(self, source_lane_index, range_m: float = 80.0) -> bool:
+        """True if any non-ego vehicle is within range_m longitudinally in source_lane_index."""
+        if source_lane_index is None:
+            return False
+        try:
+            src_lane = self.road.network.get_lane(source_lane_index)
+        except Exception:
+            return False
+        ego_lon, _ = src_lane.local_coordinates(self.vehicle.position)
+        for v in self.road.vehicles:
+            if v is self.vehicle:
+                continue
+            if v.lane_index != source_lane_index:
+                continue
+            v_lon, _ = src_lane.local_coordinates(v.position)
+            if abs(v_lon - ego_lon) < range_m:
+                return True
+        return False
 
     def _r_fn_lc_progress(self) -> float:
         _, _, curr_id = self.vehicle.lane_index
@@ -806,11 +933,36 @@ class LaneChangingEnv(HighwayEnv):
         return 0.0
 
     def _r_fn_gap(self) -> float:
-        sv = self._get_surrounding_vehicles()
-        if sv.front_v is None:
-            return 1.0
-        comfortable_gap = max(float(self.vehicle.speed) * 2.0, 10.0)
-        return float(np.clip(sv.front_gap / comfortable_gap, 0.0, 1.0))
+        """Three-zone gap reward.
+        Below lower_bound : penalty  (-1 → 0)   — too close, must brake or LC.
+        Comfortable band   : reward   (0 → +1)   — ideal following distance.
+        Above upper_bound  : reward speed limit  (-1 stopped → +1 at limit)
+                             — open road should be used, not wasted by crawling."""
+        sv          = self._get_surrounding_vehicles()
+        speed       = float(self.vehicle.speed)
+        speed_limit = float(self.config.get("speed_limit", 30.0))
+        headway     = 2.0  # seconds
+
+        comfortable_gap = max(speed * headway, 10.0)
+        lower_bound     = comfortable_gap * 0.5
+        upper_bound     = comfortable_gap * 3.0
+
+        front_gap = sv.front_gap if sv.front_v is not None else float("inf")
+
+        if front_gap < lower_bound:
+            # -1 at gap=0, 0 at gap=lower_bound
+            return float(np.clip(front_gap / max(lower_bound, 1.0) - 1.0, -1.0, 0.0))
+
+        if front_gap <= upper_bound:
+            # 0 at lower_bound, +1 at comfortable_gap and beyond
+            return float(np.clip(
+                (front_gap - lower_bound) / max(comfortable_gap - lower_bound, 1.0),
+                0.0, 1.0,
+            ))
+
+        # Open road (gap > upper_bound or no vehicle ahead):
+        # -1 when stopped, 0 at half speed limit, +1 at speed limit
+        return float(np.clip(2.0 * speed / max(speed_limit, 1.0) - 1.0, -1.0, 1.0))
 
     def _r_fn_closing_speed(self) -> float:
         sv = self._get_surrounding_vehicles()
