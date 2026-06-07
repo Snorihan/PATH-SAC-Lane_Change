@@ -155,7 +155,7 @@ PHASE_CONFIGS = {
         "blocked_merge_weight":             -10.0,
         "jerk_weight":                        0.0,
         "lat_accel_weight":                   0.0,
-        "speed_limit_weight":                 0.0,
+        "speed_limit_weight":                 1.0,  # mild: doesn't overwhelm lane_success incentive (~0.1/step effective)
         "time_penalty":                       0.0,
         "lane_start_bonus":                   0.0,
         "lane_keeping_penalty_when_requested": 0.0,
@@ -177,9 +177,9 @@ PHASE_CONFIGS = {
         "speed_limit_weight":                 1.0,
         "time_penalty":                       0.05,
         "lane_start_bonus":                   0.0,
-        "lane_keeping_penalty_when_requested": 0.0,
-        "wrong_lane_penalty":                  1.0,
-        "oscillation_penalty_weight":         20.0,
+        "lane_keeping_penalty_when_requested":  3.0,  # 0.3/step effective: pressure to pursue next target, not park
+        "wrong_lane_penalty":                   1.0,
+        "oscillation_penalty_weight":          20.0,
     },
 }
 
@@ -246,6 +246,10 @@ def make_env(phase: int = 1):
         config["vehicles_count"]          = 0
         config["continuous_targets"]      = True
         config["require_obstacle_for_lc"] = True
+
+    if phase == 3:
+        config["continuous_targets"] = True
+        config["max_lane_changes"]   = 3   # terminate after 3 successful LCs; agent must keep driving between them
 
     env = gym.make("lane-changing-v0", config=config)
     if phase not in (0, 1, 11, 15):

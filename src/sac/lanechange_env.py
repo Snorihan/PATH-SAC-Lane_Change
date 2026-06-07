@@ -202,6 +202,7 @@ class LaneChangingEnv(HighwayEnv):
         self.prev_lat = 0.0
         self.steps_in_target_lane = 0
         self.steps_after_success = 0
+        self.successful_lc_count = 0
         self.elapsed_steps = 0
         self.last_jerk_value = 0.0
         self.prev_reward_time = float(getattr(self, "time", 0.0))
@@ -509,6 +510,10 @@ class LaneChangingEnv(HighwayEnv):
         if continuous:
             new_target = self.find_target_lane(self.vehicle.lane_index)
             if not self._same_lane(new_target, self.vehicle.lane_index):
+                self.successful_lc_count += 1
+                max_lcs = int(self.config.get("max_lane_changes", 0))  # 0 = unlimited
+                if max_lcs > 0 and self.successful_lc_count >= max_lcs:
+                    return True  # completed N lane changes — done
                 self.target_lane_index = new_target
                 self.ultimate_target_lane_index = new_target
                 self.got_lane_success = False
@@ -516,7 +521,7 @@ class LaneChangingEnv(HighwayEnv):
                 self.steps_after_success = 0
                 self.started_lane_change = False
                 return False   # continue episode with new target
-        return True  # terminate (single-lane road or continuous_targets=False)
+        return True  # terminate (no valid next lane or continuous_targets=False)
 
     # ── Reset ─────────────────────────────────────────────────────────────────
 

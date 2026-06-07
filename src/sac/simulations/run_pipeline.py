@@ -29,10 +29,10 @@ P1B_TIMESTEPS      = 150_000
 P15_CHECKPOINT_DIR = "checkpoints/p15_v6"
 P15_TIMESTEPS      = 150_000
 
-P2_CHECKPOINT_DIR  = "checkpoints/p2_v5"
+P2_CHECKPOINT_DIR  = "checkpoints/p2_v7"
 P2_TIMESTEPS       = 200_000
 
-P3_CHECKPOINT_DIR  = "checkpoints/p3_v6"
+P3_CHECKPOINT_DIR  = "checkpoints/p3_v9"
 P3_TIMESTEPS       = 400_000
 
 # ── Commands ──────────────────────────────────────────────────────────────────

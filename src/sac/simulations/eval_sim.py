@@ -66,6 +66,9 @@ def make_env(phase: int = 3, lanes: int = None, render: bool = True):
         config["vehicles_count"]          = 0
         config["continuous_targets"]      = True
         config["require_obstacle_for_lc"] = True
+    if phase == 3:
+        config["continuous_targets"] = True
+        config["max_lane_changes"]   = 3
 
     # --lanes flag overrides the phase default
     if lanes is not None:
